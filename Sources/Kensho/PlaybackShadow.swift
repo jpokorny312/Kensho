@@ -197,6 +197,8 @@ public final class PlaybackShadow {
 
     public func playerFailed(_ reason: String) {
         guard !isEnded else { return }
+        // (The app tells of a failure from several places - the notification, the start of the reconnect - for one and the same.)
+        if case .failed = coordinator.state.phase { return }
         coordinator.send(.engineFailed(coordinator.state.epoch, reason: reason))
     }
 
