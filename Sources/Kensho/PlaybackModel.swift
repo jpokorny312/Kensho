@@ -1,9 +1,9 @@
 import Foundation
 
-/// Identifies one engine session. Every load, quality swap and stop starts a
-/// new one; anything an engine reports for an older epoch is dropped. Without
-/// this, a late "ready" from the item that was just replaced flips the UI to
-/// playing over a black frame.
+/// Identifies one engine session. Every load, prepared replacement and stop
+/// starts a new one; anything an engine reports for an epoch that is not (or
+/// no longer) current is dropped. Without this, a late "ready" from the item
+/// that was just replaced flips the UI to playing over a black frame.
 public struct Epoch: Hashable, Comparable, Sendable {
     public let rawValue: Int
     public init(_ rawValue: Int) { self.rawValue = rawValue }
@@ -61,18 +61,31 @@ public enum Phase: Equatable, Sendable {
     /// Starved of data while the viewer wants to play.
     case buffering
     case seeking
-    /// A replacement engine session (quality change) is being prepared.
+    /// A replacement session has taken over and is getting to the position
+    /// (or the running one died and its replacement is the way on).
     case switching
     case failed(String)
     case stopped
 }
 
+/// A replacement session (a quality change) that is being prepared WHILE the
+/// running one keeps playing: the viewer sees no gap, only the moment it takes
+/// over. (The players make it before they break it; the position is read when
+/// the replacement takes over, not when it was asked for.)
+public struct PendingSwap: Equatable, Sendable {
+    public var epoch: Epoch
+    public var quality: QualityChoice
+    /// The replacement is prepared and waits only for a steady moment to take over (not in the middle of a seek).
+    var isReady: Bool
+}
+
 public struct PlaybackState: Equatable, Sendable {
+    /// The session that is live: engine reports for any other epoch are dropped.
     public var epoch: Epoch = .initial
     public var phase: Phase = .idle
     /// What the viewer wants, kept apart from what the engine is doing. A seek
     /// or a swap interrupts playback, but must not forget that the viewer had
-    /// pressed play — or silently resume a viewer who had paused.
+    /// pressed play - or silently resume a viewer who had paused.
     public var wantsPlay: Bool = false
     public var source: MediaSource?
     public var quality: QualityChoice?
@@ -80,11 +93,18 @@ public struct PlaybackState: Equatable, Sendable {
     /// Position the UI shows. During a seek this is the target, not whatever
     /// the engine still reports from before the jump.
     public var position: TimeInterval = 0
+    /// A replacement being prepared; the running session is `epoch` until it takes over.
+    public internal(set) var swap: PendingSwap?
 
     var seekToken: SeekToken = SeekToken(0)
     var pendingSeek: TimeInterval?
     var pendingSelection: TrackSelection?
     var lastQualityChange: TimeInterval?
+    /// The last epoch handed out. `epoch` is the live one, which is not always
+    /// the latest: a replacement being prepared already has its own.
+    var lastIssuedEpoch: Epoch = .initial
+    /// Why the running session died while a replacement was on its way (the replacement is then the way on; if it fails too, this is the failure).
+    var lostWhileSwapping: String?
 
     public init() {}
 
