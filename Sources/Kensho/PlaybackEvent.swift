@@ -20,19 +20,32 @@ public enum PlaybackEvent: Equatable, Sendable {
     case engineRecovered(Epoch)
     case engineTick(Epoch, position: TimeInterval)
     case seekFinished(Epoch, SeekToken)
+    /// A replacement session (`prepareSwap`) is ready to take over.
+    case swapPrepared(Epoch)
+    /// A replacement session could not be made. The running one goes on.
+    case swapFailed(Epoch, reason: String)
+    /// The replacement that took over (`commitSwap`) is at its position and can play.
     case swapFinished(Epoch)
 }
 
 /// What the host must do in response. The reducer never touches an engine;
 /// it only describes the next step, which keeps it testable.
+///
+/// An engine starts every session it is asked for - a `load`, a `commitSwap` -
+/// paused at its position; the reducer's `play` is what sets it going.
 public enum PlaybackEffect: Equatable, Sendable {
     case load(Epoch, MediaSource, startAt: TimeInterval, selection: TrackSelection, quality: QualityChoice?)
     case play(Epoch)
     case pause(Epoch)
     case seek(Epoch, SeekToken, to: TimeInterval)
     case applySelection(Epoch, TrackSelection)
-    /// Replace the running session, resuming at `startAt`. Position is carried
-    /// over so a quality change is not a restart.
-    case swap(Epoch, QualityChoice, startAt: TimeInterval, selection: TrackSelection)
+    /// Get a replacement session ready WHILE the running one plays on. `startAt` is where the running one was when it was asked for; the
+    /// replacement is told where to begin by `commitSwap`, when it takes over.
+    case prepareSwap(Epoch, QualityChoice, startAt: TimeInterval, selection: TrackSelection)
+    /// The prepared session (`Epoch`) takes over from the running one (`replacing`), beginning at `at` - the position NOW, not the one at the
+    /// request - with `selection` applied. The old session ends.
+    case commitSwap(Epoch, replacing: Epoch, at: TimeInterval, selection: TrackSelection)
+    /// A replacement that is not wanted any more (the viewer loaded something else, or stopped) is thrown away.
+    case discardSwap(Epoch)
     case stop(Epoch)
 }
