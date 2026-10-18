@@ -26,7 +26,9 @@ private final class EngineHarness {
         player.isMuted = true
         engine = AVPlayerEngine(
             player: player,
-            provider: { [unowned self] source, quality in
+            provider: { [weak self] source, quality in
+                // (A session the test has left may still ask: nothing is there to answer.)
+                guard let self else { throw Failure.noItem("the test is over") }
                 self.provided.append((source, quality))
                 if let make = self.make { return try await make(source, quality) }
                 let key = quality.map { "\(source.id)-\($0.id)" } ?? source.id
@@ -35,7 +37,7 @@ private final class EngineHarness {
             },
             applier: applier
         )
-        engine.onEvent = { [unowned self] in self.events.append($0) }
+        engine.onEvent = { [weak self] in self?.events.append($0) }
     }
 
     deinit { try? FileManager.default.removeItem(at: directory) }

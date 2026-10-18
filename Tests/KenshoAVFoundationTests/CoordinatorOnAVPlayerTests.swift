@@ -27,18 +27,18 @@ private final class Rig {
         player.isMuted = true
         engine = AVPlayerEngine(
             player: player,
-            provider: { [unowned self] source, quality in
-                guard let url = self.files[quality.map { "\(source.id)-\($0.id)" } ?? source.id] ?? self.files[source.id] else {
+            provider: { [weak self] source, quality in
+                guard let self, let url = self.files[quality.map { "\(source.id)-\($0.id)" } ?? source.id] ?? self.files[source.id] else {
                     throw CocoaError(.fileNoSuchFile)
                 }
                 return AVPlayerItem(url: url)
             },
-            applier: { [unowned self] _, selection in self.applied.append(selection) }
+            applier: { [weak self] _, selection in self?.applied.append(selection) }
         )
-        coordinator = PlaybackCoordinator(engine: engine, clock: { [unowned self] in self.now })
+        coordinator = PlaybackCoordinator(engine: engine, clock: { [weak self] in self?.now ?? 0 })
         // The phases the film went through: a state change that only moved the position is not one.
-        coordinator.onStateChange = { [unowned self] in if self.phases.last != $0.phase { self.phases.append($0.phase) } }
-        coordinator.onTransition = { [unowned self] _, _, effects in self.effects.append(contentsOf: effects) }
+        coordinator.onStateChange = { [weak self] in if let self, self.phases.last != $0.phase { self.phases.append($0.phase) } }
+        coordinator.onTransition = { [weak self] _, _, effects in self?.effects.append(contentsOf: effects) }
     }
 
     deinit { try? FileManager.default.removeItem(at: directory) }

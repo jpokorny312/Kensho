@@ -397,11 +397,17 @@ public final class AVPlayerEngine: PlaybackEngine {
                 // Every change is seen, also those of a session that is not running yet: what the
                 // status was before is what tells a stall from a start. The reducer ignores both
                 // reports outside the phases they apply to.
-                let report = self.stallWatch.observe(status, seekInFlight: self.live?.seek != nil)
-                guard let session = self.live, session.stage == .running, let report else { return }
-                switch report {
-                case .stalled: self.onEvent?(.engineStalled(session.epoch))
-                case .recovered: self.onEvent?(.engineRecovered(session.epoch))
+                let now = ProcessInfo.processInfo.systemUptime
+                let report = self.stallWatch.observe(status, seekInFlight: self.live?.seek != nil, now: now)
+                self.report(report)
+                // A start that waits longer than the grace is a stall after all: asked again when the grace is over (by a task that does not
+                // hold the engine while it waits - an engine its owner has let go of must not be kept alive for three seconds).
+                if status == .waitingToPlayAtSpecifiedRate {
+                    Task { @MainActor [weak self] in
+                        try? await Task.sleep(nanoseconds: UInt64(StallWatch.resumeGrace * 1_000_000_000))
+                        guard let self else { return }
+                        self.report(self.stallWatch.graceIsOver(now: ProcessInfo.processInfo.systemUptime))
+                    }
                 }
             }
         }
@@ -413,6 +419,14 @@ public final class AVPlayerEngine: PlaybackEngine {
                 guard let self, let session = self.live, session.stage == .running, time.isValid, time.isNumeric else { return }
                 self.onEvent?(.engineTick(session.epoch, position: time.seconds))
             }
+        }
+    }
+
+    private func report(_ report: StallWatch.Report?) {
+        guard let report, let session = live, session.stage == .running else { return }
+        switch report {
+        case .stalled: onEvent?(.engineStalled(session.epoch))
+        case .recovered: onEvent?(.engineRecovered(session.epoch))
         }
     }
 
