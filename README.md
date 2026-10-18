@@ -10,7 +10,7 @@ Das Paket liegt in diesem Repository (`Kensho/`) und ist als lokales Paket in `J
 | `KenshoAVFoundation` | Was die Player mit AVFoundation tun, ohne PrismCore: `DiagnosticLog` (das Protokoll der App), `PlaylistDiagnostics`, `PlayerItemLogDump` | Kensho |
 | `KenshoPrismCore` | Eine PrismCore-Sitzung bauen, starten und im Fehlerfall abbauen (`PrismCoreLauncher`), die HDMI-Umschaltung des Apple TV (`TVDisplayCoordination`) | Kensho, KenshoAVFoundation, PrismCore, MPVKit |
 
-Tests: `cd Kensho && swift test` (macOS; 80 Tests, ohne Gerät). Der Rest wird durch die UI-Tests des Harness geprüft (`Scripts/UITestHarness`).
+Tests: `cd Kensho && swift test` (macOS; 84 Tests, ohne Gerät). Der Rest wird durch die UI-Tests des Harness geprüft (`Scripts/UITestHarness`).
 
 PrismCore ist hier **auf denselben Commit** festgelegt wie im Xcode-Projekt (zwei verschiedene Anforderungen an dasselbe Paket lässt SwiftPM nicht zu). Beim Anheben alle Stellen zusammen ändern;
 `Scripts/check_prismcore_pin.py` prüft, dass sie übereinstimmen.

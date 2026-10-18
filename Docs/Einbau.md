@@ -26,7 +26,7 @@ Die Diagnose der Playlist (`PlaylistDiagnostics`): iPhone `.full` und mit Warten
 
 ## Prüfen
 
-- `cd Kensho && swift test` — 80 Tests, ohne Gerät: Sitzungen und Rotation des Protokolls, Fehlerketten, Routing, der Reducer samt Wechsel der Qualität, der Controller, die Diagnose der Playlist (gegen eine gespielte Antwort).
+- `cd Kensho && swift test` — 84 Tests, ohne Gerät: Sitzungen und Rotation des Protokolls, Fehlerketten, Routing, der Reducer samt Wechsel der Qualität, der Controller, die Diagnose der Playlist (gegen eine gespielte Antwort).
 - `swift test` im Hauptordner (das Kit) und die UI-Tests des Harness: `Scripts/UITestHarness/run-ios-tests.sh`, `run-tvos-tests.sh`. Die Wege durch den Launcher decken ab: `testAFilmWithEAC3AudioKeepsItsSoundThroughPrismCore`
   (HEVC + E-AC-3 über PrismCore, die Zeile `audio: #1 bridged … master.m3u8`), `testAnHTTPSStreamIsReadThroughTheSystemAndPlays` (der Leser und sein Protokoll), `testAutoAdvanceEndsInThePreparedEpisode` (Vorbereitung der nächsten Folge),
   die CarPlay-Tests; auf der Apple TV `testNextEpisodeIsPreparedBeforeItIsDue` (Vorbereitung ohne Umschalten des Bildschirms). Die HDMI-Umschaltung (`TVDisplayCoordination`) gibt es im Simulator nicht: sie ist gebaut, aber nur auf der
