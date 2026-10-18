@@ -174,6 +174,15 @@ public final class PlaybackShadow {
         coordinator.send(.swapPrepared(swap.epoch))
     }
 
+    /// The app has put a new item in and says whether it plays on - its `replaceItem` always does. Where the viewer had paused, that is the loss this
+    /// state machine exists to prevent (a reconnect, a rebuild or a swap undoes his pause), and it is said at once: the comparison that runs with the
+    /// ticks only reports what lasts, and the app sets the flag back some moments later.
+    public func replacementPlays(_ appPlays: Bool) {
+        guard !isEnded, appPlays, !coordinator.state.wantsPlay else { return }
+        deviationCount += 1
+        log.log("DEVIATION replacement-resumes: the app plays on after replacing the stream, the viewer had paused (the state machine keeps his pause, \(Self.phase(coordinator.state.phase)))", tag: tag)
+    }
+
     /// The app calls the change off after it began it (the old stream recovered, the player was changed meanwhile, resolving failed).
     public func qualityChangeCalledOff(_ why: String) {
         guard !isEnded else { return }

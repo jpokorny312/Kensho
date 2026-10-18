@@ -216,6 +216,27 @@ final class PlaybackShadowTests: XCTestCase {
         XCTAssertEqual(memory.count("DEVIATION phase"), 0, "one cause, one line")
     }
 
+    func testAnAppThatPlaysOnAfterReplacingTheStreamOfAPausedViewerIsCaughtAtOnce() {
+        let shadow = makeShadow()
+        startedPlaying(shadow)
+        shadow.pause()
+        shadow.begin(item: "film", startAt: 50, quality: "original", audio: 1, subtitle: nil, reason: "rebuild", startsPlayback: false)
+        // The app's replaceItem sets isPlaying = true as its last line: it is known at once, not after it has lasted.
+        shadow.replacementPlays(true)
+        XCTAssertTrue(memory.contains("DEVIATION replacement-resumes"), "lines: \(memory.lines)")
+        XCTAssertEqual(shadow.deviationCount, 1)
+    }
+
+    func testAReplacementThatLeavesTheViewerWhereHeWasIsNoDeviation() {
+        let shadow = makeShadow()
+        startedPlaying(shadow)
+        shadow.begin(item: "film", startAt: 50, quality: "original", audio: 1, subtitle: nil, reason: "reconnect", startsPlayback: false)
+        shadow.replacementPlays(true)       // playing before, playing after
+        shadow.pause()
+        shadow.replacementPlays(false)      // paused, and the app leaves it so
+        XCTAssertFalse(memory.contains("DEVIATION"), "lines: \(memory.lines)")
+    }
+
     func testAnItemTheViewerStartsPlaysWhateverWasBefore() {
         let shadow = makeShadow()
         startedPlaying(shadow)
