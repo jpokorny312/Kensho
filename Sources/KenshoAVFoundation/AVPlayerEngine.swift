@@ -10,7 +10,12 @@ import Kensho
 ///
 /// A quality change is made before it is broken: `prepareSwap` brings the
 /// replacement's item to `readyToPlay` on a second, silent player while
-/// `player` plays on, and only `commitSwap` moves it over.
+/// `player` plays on, and only `commitSwap` puts it on `player`.
+///
+/// What the engine reports as a stall is playback that ran dry after it had
+/// started, not the wait for the first data after `play()`, a seek or a swap:
+/// AVPlayer shows `waitingToPlayAtSpecifiedRate` for every one of those, and
+/// a quality policy that took each for a weak link would step down for nothing.
 @MainActor
 public final class AVPlayerEngine: PlaybackEngine {
     public var onEvent: ((PlaybackEvent) -> Void)?
@@ -24,7 +29,12 @@ public final class AVPlayerEngine: PlaybackEngine {
     /// Applies the viewer's track choice to an item. The default maps the
     /// numbers to option positions inside AVFoundation's audible and legible
     /// groups; an app that maps stream indices differently passes its own.
+    /// Calls for one session never overlap and never run in the wrong order.
     public typealias SelectionApplier = @MainActor (AVPlayerItem, TrackSelection) async -> Void
+
+    /// How often a seek that ended without the reducer having asked for a newer
+    /// one is tried again before the session is given up.
+    private static let maxSeekAttempts = 3
 
     /// What one epoch stands for on this engine.
     @MainActor
@@ -41,6 +51,12 @@ public final class AVPlayerEngine: PlaybackEngine {
             case running
         }
 
+        struct SeekRequest {
+            var token: SeekToken
+            var target: TimeInterval
+            var attempts: Int
+        }
+
         let epoch: Epoch
         /// What the reducer is told when the session is at its position: a
         /// fresh load is `engineReady`, a replacement that took over is
@@ -50,10 +66,16 @@ public final class AVPlayerEngine: PlaybackEngine {
         var item: AVPlayerItem?
         var startAt: TimeInterval = 0
         var selection = TrackSelection()
+        var seek: SeekRequest?
+        /// Whether the player has been playing since the session was last
+        /// started, resumed or moved. Waiting before that is the start.
+        var hasPlayedSinceStart = false
+        var hasFailed = false
         var statusObservation: NSKeyValueObservation?
         var failureObserver: NSObjectProtocol?
         var resolveTask: Task<Void, Never>?
         var startTask: Task<Void, Never>?
+        var selectionTask: Task<Void, Never>?
 
         init(epoch: Epoch, atPosition: @escaping (Epoch) -> PlaybackEvent) {
             self.epoch = epoch
@@ -63,6 +85,7 @@ public final class AVPlayerEngine: PlaybackEngine {
         func end() {
             resolveTask?.cancel()
             startTask?.cancel()
+            selectionTask?.cancel()
             statusObservation = nil
             if let failureObserver { NotificationCenter.default.removeObserver(failureObserver) }
             failureObserver = nil
@@ -71,6 +94,7 @@ public final class AVPlayerEngine: PlaybackEngine {
 
     private let provider: ItemProvider
     private let applier: SelectionApplier
+    private let log: KenshoLog
     /// The session whose item is on `player`.
     private var live: Session?
     /// The replacement being made; `player` plays on while it is.
@@ -89,14 +113,18 @@ public final class AVPlayerEngine: PlaybackEngine {
     private var rateObservation: NSKeyValueObservation?
     private var timeObserver: Any?
 
+    /// - Parameter log: where a failed session is written in full (domain, code and
+    ///   everything nested), under the tag `kensho`. The report to the reducer carries only a line.
     public init(
         player: AVPlayer = AVPlayer(),
         provider: @escaping ItemProvider,
-        applier: SelectionApplier? = nil
+        applier: SelectionApplier? = nil,
+        log: KenshoLog = .silent
     ) {
         self.player = player
         self.provider = provider
         self.applier = applier ?? AVPlayerEngine.defaultApplier
+        self.log = log
         observePlayer()
     }
 
@@ -109,14 +137,15 @@ public final class AVPlayerEngine: PlaybackEngine {
         case let .load(epoch, source, startAt, selection, quality):
             endReplacement()
             endLive()
+            // What the viewer was looking at stays on the player, paused, until
+            // the new item can take its place: nothing is torn down early.
+            player.pause()
             self.source = source
             let session = Session(epoch: epoch, atPosition: { .engineReady($0) })
             session.startAt = startAt
             session.selection = selection
             live = session
-            resolve(session, source: source, quality: quality) { [unowned self] item in
-                self.attachToPlayer(session, item: item)
-            }
+            resolve(session, source: source, quality: quality)
 
         case let .prepareSwap(epoch, quality, startAt, selection):
             endReplacement()
@@ -128,15 +157,10 @@ public final class AVPlayerEngine: PlaybackEngine {
             session.startAt = startAt
             session.selection = selection
             replacement = session
-            resolve(session, source: source, quality: quality) { [unowned self] item in
-                session.stage = .loading
-                session.item = item
-                self.observeStatus(of: session, item: item)
-                self.staging.replaceCurrentItem(with: item)
-            }
+            resolve(session, source: source, quality: quality)
 
         case let .commitSwap(epoch, replacing, at, selection):
-            guard let session = replacement, session.epoch == epoch, session.stage == .prepared, let item = session.item else {
+            guard let session = replacement, session.epoch == epoch, session.stage == .prepared, let prepared = session.item else {
                 onEvent?(.engineFailed(epoch, reason: "no prepared session \(epoch.rawValue) to take over from \(replacing.rawValue)"))
                 return
             }
@@ -145,7 +169,14 @@ public final class AVPlayerEngine: PlaybackEngine {
             live = session
             session.startAt = at
             session.selection = selection
+            // The prepared item has done its job - it proved on the staging player that the stream
+            // loads - and cannot go any further: AVFoundation refuses an item that has been on one
+            // player on another (NSInvalidArgumentException, even after it was taken off the first,
+            // and an exception through Swift's async frames ends the process). A copy has the same
+            // asset, so what was loaded is not loaded again, and the same settings.
+            session.statusObservation = nil
             staging.replaceCurrentItem(with: nil)
+            let item = (prepared.copy() as? AVPlayerItem) ?? AVPlayerItem(asset: prepared.asset)
             attachToPlayer(session, item: item)
 
         case let .discardSwap(epoch):
@@ -153,34 +184,47 @@ public final class AVPlayerEngine: PlaybackEngine {
             endReplacement()
 
         case let .play(epoch):
-            guard live?.epoch == epoch else { return }
+            guard let session = live, session.epoch == epoch else { return }
+            session.hasPlayedSinceStart = false
             player.play()
 
         case let .pause(epoch):
-            guard live?.epoch == epoch else { return }
+            guard let session = live, session.epoch == epoch else { return }
+            session.hasPlayedSinceStart = false
             player.pause()
 
         case let .seek(epoch, token, target):
-            guard live?.epoch == epoch else { return }
-            let time = CMTime(seconds: target, preferredTimescale: 600)
-            // Zero tolerance: a keyframe-snapped seek lands a few seconds
-            // off the target and the picture jumps back after it.
-            player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
-                // A seek superseded by a newer one completes with `false`.
-                // The token already drops it; ignoring it here avoids
-                // reporting a position the player never reached.
-                guard finished else { return }
-                Task { @MainActor in self?.onEvent?(.seekFinished(epoch, token)) }
+            guard let session = live, session.epoch == epoch else { return }
+            guard session.stage == .running else {
+                // The reducer holds a seek back until the session is at its position. One that comes
+                // earlier is a mistake somewhere else, and an answer is owed all the same.
+                onEvent?(.engineFailed(epoch, reason: "asked to seek before the session was at its position"))
+                return
             }
+            // Waiting after a jump is the jump, not starvation.
+            session.hasPlayedSinceStart = false
+            session.seek = Session.SeekRequest(token: token, target: target, attempts: 0)
+            runSeek(of: session)
 
         case let .applySelection(epoch, selection):
-            guard let session = live, session.epoch == epoch, let item = session.item else { return }
-            Task { await applier(item, selection) }
+            guard let session = live, session.epoch == epoch, session.stage == .running, let item = session.item else { return }
+            // Each call carries the whole choice, so only the newest matters - but the older one may
+            // be half way through and must be out of the way before the newer starts, or the older
+            // can finish last and leave the item on the choice the viewer has already replaced.
+            let previous = session.selectionTask
+            previous?.cancel()
+            session.selectionTask = Task { [weak self, weak session] in
+                await previous?.value
+                guard !Task.isCancelled, let self, let session, session === self.live else { return }
+                await self.applier(item, selection)
+            }
 
         case .stop:
             endReplacement()
             endLive()
             source = nil
+            player.pause()
+            player.replaceCurrentItem(with: nil)
         }
     }
 
@@ -188,16 +232,20 @@ public final class AVPlayerEngine: PlaybackEngine {
 
     /// Asks the provider for the session's item. A newer instruction ends the
     /// session; what the provider returns after that is dropped.
-    private func resolve(_ session: Session, source: MediaSource, quality: QualityChoice?, then attach: @escaping (AVPlayerItem) -> Void) {
+    private func resolve(_ session: Session, source: MediaSource, quality: QualityChoice?) {
         session.resolveTask = Task { [weak self, weak session] in
             guard let self, let session else { return }
             do {
                 let item = try await self.provider(source, quality)
                 guard !Task.isCancelled, self.isCurrent(session) else { return }
-                attach(item)
+                if session === self.live {
+                    self.attachToPlayer(session, item: item)
+                } else {
+                    self.attachToStaging(session, item: item)
+                }
             } catch {
                 guard !Task.isCancelled, self.isCurrent(session) else { return }
-                self.fail(session, reason: Self.reason(for: error))
+                self.fail(session, error: error)
             }
         }
     }
@@ -207,7 +255,9 @@ public final class AVPlayerEngine: PlaybackEngine {
     }
 
     /// Puts the item on `player`, paused: a session starts where it is told to
-    /// and plays when the reducer says so.
+    /// and plays when the reducer says so. AVPlayer keeps its rate across
+    /// `replaceCurrentItem`, so without the pause an item that replaces a
+    /// playing one would play on by itself, from its beginning.
     private func attachToPlayer(_ session: Session, item: AVPlayerItem) {
         session.stage = .starting
         session.item = item
@@ -216,19 +266,26 @@ public final class AVPlayerEngine: PlaybackEngine {
             forName: AVPlayerItem.failedToPlayToEndTimeNotification, object: item, queue: .main
         ) { [weak self, weak session] note in
             let error = note.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error
-            let reason = Self.reason(for: error)
             Task { @MainActor in
                 guard let self, let session, session === self.live else { return }
-                self.fail(session, reason: reason)
+                self.fail(session, error: error)
             }
         }
         player.pause()
         player.replaceCurrentItem(with: item)
     }
 
+    private func attachToStaging(_ session: Session, item: AVPlayerItem) {
+        session.stage = .loading
+        session.item = item
+        observeStatus(of: session, item: item)
+        staging.replaceCurrentItem(with: item)
+    }
+
+    /// The status stays observed for as long as the session lives: an item that
+    /// is ready can still fail, and a stream that dies while it plays is the
+    /// failure that matters most.
     private func observeStatus(of session: Session, item: AVPlayerItem) {
-        // `.initial`: an item that is ready already (a prepared one that was
-        // moved to another player) is not announced by a change.
         session.statusObservation = item.observe(\.status, options: [.initial, .new]) { [weak self, weak session] item, _ in
             let status = item.status
             let error = item.error
@@ -245,28 +302,76 @@ public final class AVPlayerEngine: PlaybackEngine {
             session.stage = .prepared
             onEvent?(.swapPrepared(session.epoch))
         case (.readyToPlay, .starting):
-            guard let item = session.item else { return }
-            session.startTask = Task { [weak self, weak session] in
-                guard let self, let session else { return }
-                if session.startAt > 0 {
-                    let time = CMTime(seconds: session.startAt, preferredTimescale: 600)
-                    await item.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero)
-                }
-                await self.applier(item, session.selection)
-                guard !Task.isCancelled, session === self.live else { return }
-                session.stage = .running
-                self.onEvent?(session.atPosition(session.epoch))
-            }
+            start(session)
         case (.failed, _):
-            fail(session, reason: Self.reason(for: error))
+            fail(session, error: error)
         default:
             break
         }
     }
 
+    /// Gets a session that is on the player to its start position and reports it.
+    private func start(_ session: Session) {
+        guard session.startTask == nil, let item = session.item else { return }
+        session.startTask = Task { [weak self, weak session] in
+            guard let self, let session else { return }
+            if session.startAt > 0 {
+                let time = CMTime(seconds: session.startAt, preferredTimescale: 600)
+                var landed = false
+                for _ in 0..<Self.maxSeekAttempts where !landed {
+                    landed = await item.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero)
+                    guard !Task.isCancelled, session === self.live else { return }
+                }
+                guard landed else {
+                    self.fail(session, reason: "could not get to the start position \(session.startAt)")
+                    return
+                }
+            }
+            await self.applier(item, session.selection)
+            guard !Task.isCancelled, session === self.live else { return }
+            session.stage = .running
+            self.onEvent?(session.atPosition(session.epoch))
+        }
+    }
+
+    private func runSeek(of session: Session) {
+        guard var request = session.seek else { return }
+        request.attempts += 1
+        session.seek = request
+        let time = CMTime(seconds: request.target, preferredTimescale: 600)
+        // Zero tolerance: a keyframe-snapped seek lands a few seconds
+        // off the target and the picture jumps back after it.
+        player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self, weak session] finished in
+            Task { @MainActor in
+                // A newer seek replaced this one (its token is the one in `session.seek` now), or the
+                // session is gone: the newer one answers, and reporting this one would report a
+                // position the player never reached.
+                guard let self, let session, session === self.live, session.seek?.token == request.token else { return }
+                if finished {
+                    session.seek = nil
+                    self.onEvent?(.seekFinished(session.epoch, request.token))
+                } else if request.attempts < Self.maxSeekAttempts {
+                    // Nothing newer was asked for, yet AVPlayer ended it: something else moved the
+                    // player. Without an answer the reducer would wait in `.seeking` for good.
+                    self.runSeek(of: session)
+                } else {
+                    session.seek = nil
+                    self.fail(session, reason: "the seek to \(request.target) did not complete after \(request.attempts) attempts")
+                }
+            }
+        }
+    }
+
     /// A session that cannot go on: a replacement is given up (the live one
     /// plays on), the live one is reported to the reducer.
+    private func fail(_ session: Session, error: Error?) {
+        log.log("session \(session.epoch.rawValue) failed: \(ErrorDescription.describe(error as NSError?))", tag: "kensho")
+        fail(session, reason: Self.reason(for: error))
+    }
+
     private func fail(_ session: Session, reason: String) {
+        guard !session.hasFailed else { return }
+        session.hasFailed = true
         if session === replacement {
             endReplacement()
             onEvent?(.swapFailed(session.epoch, reason: reason))
@@ -278,8 +383,6 @@ public final class AVPlayerEngine: PlaybackEngine {
     private func endLive() {
         live?.end()
         live = nil
-        player.pause()
-        player.replaceCurrentItem(with: nil)
     }
 
     private func endReplacement() {
@@ -292,16 +395,20 @@ public final class AVPlayerEngine: PlaybackEngine {
     // MARK: - What the player says
 
     private func observePlayer() {
-        // Waiting while play was requested is a stall; playing again is
-        // recovery. The reducer ignores both outside the phases they apply to.
         rateObservation = player.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
             let status = player.timeControlStatus
             Task { @MainActor in
-                guard let self, let epoch = self.live?.epoch else { return }
+                guard let self, let session = self.live, session.stage == .running else { return }
                 switch status {
-                case .waitingToPlayAtSpecifiedRate: self.onEvent?(.engineStalled(epoch))
-                case .playing: self.onEvent?(.engineRecovered(epoch))
-                default: break
+                case .playing:
+                    session.hasPlayedSinceStart = true
+                    self.onEvent?(.engineRecovered(session.epoch))
+                case .waitingToPlayAtSpecifiedRate:
+                    // Every start waits for its first data; only a player that had been playing and
+                    // ran dry is starved. The reducer ignores both reports outside the phases they apply to.
+                    if session.hasPlayedSinceStart { self.onEvent?(.engineStalled(session.epoch)) }
+                default:
+                    break
                 }
             }
         }
@@ -309,8 +416,9 @@ public final class AVPlayerEngine: PlaybackEngine {
             forInterval: CMTime(seconds: 0.5, preferredTimescale: 600), queue: .main
         ) { [weak self] time in
             Task { @MainActor in
-                guard let self, let epoch = self.live?.epoch, time.isValid, time.isNumeric else { return }
-                self.onEvent?(.engineTick(epoch, position: time.seconds))
+                // Before the session is at its position the player's time is the old item's, or zero.
+                guard let self, let session = self.live, session.stage == .running, time.isValid, time.isNumeric else { return }
+                self.onEvent?(.engineTick(session.epoch, position: time.seconds))
             }
         }
     }
@@ -320,10 +428,12 @@ public final class AVPlayerEngine: PlaybackEngine {
         return "\(error.domain) \(error.code): \(error.localizedDescription)"
     }
 
-    /// Option positions inside the audible and legible groups; `nil` audio
-    /// keeps AVFoundation's default, `nil` subtitle turns subtitles off.
+    /// Option positions inside the audible and legible groups. A `nil` audio
+    /// choice leaves AVFoundation's own pick alone (going back from a chosen
+    /// track to "no choice" is not undone: an app that offers that passes its
+    /// own applier); a `nil` subtitle turns subtitles off.
     private static let defaultApplier: SelectionApplier = { item, selection in
-        guard let asset = item.asset as? AVURLAsset else { return }
+        let asset = item.asset
         if let index = selection.audio,
            let group = try? await asset.loadMediaSelectionGroup(for: .audible),
            group.options.indices.contains(index) {
