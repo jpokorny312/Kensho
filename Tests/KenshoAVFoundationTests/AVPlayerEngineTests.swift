@@ -138,6 +138,47 @@ final class AVPlayerEngineTests: XCTestCase {
         XCTAssertEqual(h.stalls(of: Epoch(1)), 0, "events: \(h.events)")
     }
 
+    // MARK: - What the system does to the player
+
+    func testAPauseThatTheEngineDidNotCauseIsReportedAsThePauseItIs() async throws {
+        let h = try harness()
+        h.engine.perform(.load(Epoch(1), film, startAt: 0, selection: none, quality: nil))
+        await h.waitFor(.engineReady(Epoch(1)))
+        h.engine.perform(.play(Epoch(1)))
+        await h.wait { h.player.rate > 0 }
+        h.clearEvents()
+        // A call, Siri, the route going away or the app going to the background stops an AVPlayer by itself (AVPlayer.h: rate 0 on an interruption).
+        // Nothing the reducer asked for: without a report it goes on thinking the film plays, and its next `play` is a no-op.
+        h.player.pause()
+        let told = await h.waitFor(.pause)
+        XCTAssertTrue(told, "events: \(h.events)")
+    }
+
+    func testAPlayThatTheEngineDidNotCauseIsReportedAsThePlayItIs() async throws {
+        let h = try harness()
+        h.engine.perform(.load(Epoch(1), film, startAt: 0, selection: none, quality: nil))
+        await h.waitFor(.engineReady(Epoch(1)))
+        h.clearEvents()
+        h.player.play()     // the picture is started by something else (system UI, a view that has its own transport)
+        let told = await h.waitFor(.play)
+        XCTAssertTrue(told, "events: \(h.events)")
+    }
+
+    func testWhatTheEngineDoesItselfIsNotReportedBackAsTheViewersIntent() async throws {
+        let h = try harness()
+        h.engine.perform(.load(Epoch(1), film, startAt: 0, selection: none, quality: nil))
+        await h.waitFor(.engineReady(Epoch(1)))
+        h.clearEvents()
+        h.engine.perform(.play(Epoch(1)))
+        await h.wait { (h.lastTick(of: Epoch(1)) ?? 0) > 0.4 }
+        h.engine.perform(.pause(Epoch(1)))
+        try await Task.sleep(nanoseconds: 700_000_000)
+        h.engine.perform(.play(Epoch(1)))
+        await h.wait { h.player.rate > 0 }
+        try await Task.sleep(nanoseconds: 700_000_000)
+        XCTAssertFalse(h.events.contains(.pause) || h.events.contains(.play), "an echo would turn every instruction into an intent: \(h.events)")
+    }
+
     // MARK: - Seeking
 
     func testASeekLandsAndIsReportedWithItsToken() async throws {

@@ -109,6 +109,9 @@ public final class AVPlayerEngine: PlaybackEngine {
         return staging
     }()
     private var rateObservation: NSKeyValueObservation?
+    private var rateChangeObserver: NSObjectProtocol?
+    /// What the engine last asked of the player: playing or not. A rate that is something else was changed by someone else.
+    private var expectsPlaying = false
     private var stallWatch = StallWatch()
     private var timeObserver: Any?
 
@@ -129,6 +132,7 @@ public final class AVPlayerEngine: PlaybackEngine {
 
     deinit {
         if let timeObserver { player.removeTimeObserver(timeObserver) }
+        if let rateChangeObserver { NotificationCenter.default.removeObserver(rateChangeObserver) }
     }
 
     public func perform(_ effect: PlaybackEffect) {
@@ -138,6 +142,7 @@ public final class AVPlayerEngine: PlaybackEngine {
             endLive()
             // What the viewer was looking at stays on the player, paused, until
             // the new item can take its place: nothing is torn down early.
+            expectsPlaying = false
             player.pause()
             self.source = source
             let session = Session(epoch: epoch, atPosition: { .engineReady($0) })
@@ -184,10 +189,12 @@ public final class AVPlayerEngine: PlaybackEngine {
 
         case let .play(epoch):
             guard live?.epoch == epoch else { return }
+            expectsPlaying = true
             player.play()
 
         case let .pause(epoch):
             guard live?.epoch == epoch else { return }
+            expectsPlaying = false
             player.pause()
 
         case let .seek(epoch, token, target):
@@ -218,6 +225,7 @@ public final class AVPlayerEngine: PlaybackEngine {
             endReplacement()
             endLive()
             source = nil
+            expectsPlaying = false
             player.pause()
             player.replaceCurrentItem(with: nil)
         }
@@ -266,6 +274,7 @@ public final class AVPlayerEngine: PlaybackEngine {
                 self.fail(session, error: error)
             }
         }
+        expectsPlaying = false
         player.pause()
         player.replaceCurrentItem(with: item)
     }
@@ -344,6 +353,9 @@ public final class AVPlayerEngine: PlaybackEngine {
                 guard let self, let session, session === self.live, session.seek?.token == request.token else { return }
                 if finished {
                     session.seek = nil
+                    // (The wait that began during the jump and goes on is a start from here.)
+                    self.stallWatch.seekLanded(now: ProcessInfo.processInfo.systemUptime)
+                    self.watchTheGrace()
                     self.onEvent?(.seekFinished(session.epoch, request.token))
                 } else if request.attempts < Self.maxSeekAttempts {
                     // Nothing newer was asked for, yet AVPlayer ended it: something else moved the
@@ -400,16 +412,14 @@ public final class AVPlayerEngine: PlaybackEngine {
                 let now = ProcessInfo.processInfo.systemUptime
                 let report = self.stallWatch.observe(status, seekInFlight: self.live?.seek != nil, now: now)
                 self.report(report)
-                // A start that waits longer than the grace is a stall after all: asked again when the grace is over (by a task that does not
-                // hold the engine while it waits - an engine its owner has let go of must not be kept alive for three seconds).
-                if status == .waitingToPlayAtSpecifiedRate {
-                    Task { @MainActor [weak self] in
-                        try? await Task.sleep(nanoseconds: UInt64(StallWatch.resumeGrace * 1_000_000_000))
-                        guard let self else { return }
-                        self.report(self.stallWatch.graceIsOver(now: ProcessInfo.processInfo.systemUptime))
-                    }
-                }
+                if status == .waitingToPlayAtSpecifiedRate { self.watchTheGrace() }
             }
+        }
+        // A change of the rate the engine did not ask for: AVPlayer stops by itself for an interruption of the audio session (a call, Siri), for the app
+        // going to the background, for a route that goes away - and anything that holds the player can start or stop it. The reducer has to hear of
+        // it as the viewer's pause or play: it would go on thinking the film plays, and its next `play` would be no instruction at all.
+        rateChangeObserver = NotificationCenter.default.addObserver(forName: AVPlayer.rateDidChangeNotification, object: player, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.rateChanged() }
         }
         timeObserver = player.addPeriodicTimeObserver(
             forInterval: CMTime(seconds: 0.5, preferredTimescale: 600), queue: .main
@@ -420,6 +430,37 @@ public final class AVPlayerEngine: PlaybackEngine {
                 self.onEvent?(.engineTick(session.epoch, position: time.seconds))
             }
         }
+    }
+
+    /// A start that waits longer than the grace is a stall after all: asked again when the grace is over - by a task that does not hold the engine
+    /// while it waits (an engine its owner has let go of must not be kept alive for three seconds), and again where it came early.
+    private func watchTheGrace() {
+        Task { @MainActor [weak self] in
+            // (`self` is looked at one expression at a time: a strong reference held across the sleep would keep the engine alive.)
+            while let remaining = self?.graceRemaining() {
+                try? await Task.sleep(nanoseconds: UInt64((remaining + 0.05) * 1_000_000_000))
+                if self?.reportTheGraceIfOver() == true { return }
+            }
+        }
+    }
+
+    private func graceRemaining() -> TimeInterval? {
+        stallWatch.graceRemaining(now: ProcessInfo.processInfo.systemUptime)
+    }
+
+    private func reportTheGraceIfOver() -> Bool {
+        guard let stalled = stallWatch.graceIsOver(now: ProcessInfo.processInfo.systemUptime, seekInFlight: live?.seek != nil) else { return false }
+        report(stalled)
+        return true
+    }
+
+    private func rateChanged() {
+        guard let session = live, session.stage == .running else { return }
+        // (What the player is now, not what it was when the notification was posted: this runs a moment later.)
+        let isPlaying = player.rate > 0
+        guard isPlaying != expectsPlaying else { return }
+        expectsPlaying = isPlaying
+        onEvent?(isPlaying ? .play : .pause)
     }
 
     private func report(_ report: StallWatch.Report?) {

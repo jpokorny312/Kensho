@@ -53,8 +53,27 @@ struct StallWatch {
         }
     }
 
-    /// Asked a grace period after a wait began: a start that is still waiting is a stall now.
-    mutating func graceIsOver(now: TimeInterval) -> Report? {
+    /// A seek the engine started has landed. If the player still waits, that wait is a start from here on - the jump is done, the picture has not come -
+    /// and counts as a stall once it has lasted the grace. (A wait that began during the jump belongs to the jump, and without this nobody would ever
+    /// say that it went on.)
+    mutating func seekLanded(now: TimeInterval) {
+        if previous == .waitingToPlayAtSpecifiedRate { startWaitBegan = now }
+    }
+
+    /// How long until a start that waits counts as a stall; nil when none waits. The engine asks it again where it asked early (its clock and the
+    /// sleep of its task are not the same clock).
+    func graceRemaining(now: TimeInterval) -> TimeInterval? {
+        guard let began = startWaitBegan, previous == .waitingToPlayAtSpecifiedRate else { return nil }
+        return max(0, Self.resumeGrace - (now - began))
+    }
+
+    /// Asked a grace period after a wait began: a start that is still waiting is a stall now. While a jump is on its way the state machine would drop
+    /// it (a stall needs `playing`) and it would never be said again: the count is dropped, and `seekLanded` starts it again if the wait goes on.
+    mutating func graceIsOver(now: TimeInterval, seekInFlight: Bool) -> Report? {
+        if seekInFlight {
+            startWaitBegan = nil
+            return nil
+        }
         guard let began = startWaitBegan, previous == .waitingToPlayAtSpecifiedRate, now - began >= Self.resumeGrace else { return nil }
         startWaitBegan = nil
         return .stalled

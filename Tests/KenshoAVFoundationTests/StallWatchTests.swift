@@ -51,36 +51,77 @@ final class StallWatchTests: XCTestCase {
         var watch = StallWatch()
         XCTAssertNil(watch.observe(.paused, seekInFlight: false, now: 0))
         XCTAssertNil(watch.observe(.waitingToPlayAtSpecifiedRate, seekInFlight: false, now: 10))
-        XCTAssertNil(watch.graceIsOver(now: 12.9), "not yet: three seconds")
-        XCTAssertEqual(watch.graceIsOver(now: 13), .stalled, "the player did not get going: that is as much a thing to act on as one that broke off")
-        XCTAssertNil(watch.graceIsOver(now: 20), "said once")
+        XCTAssertNil(watch.graceIsOver(now: 12.9, seekInFlight: false), "not yet: three seconds")
+        XCTAssertEqual(watch.graceIsOver(now: 13, seekInFlight: false), .stalled, "the player did not get going: that is as much a thing to act on as one that broke off")
+        XCTAssertNil(watch.graceIsOver(now: 20, seekInFlight: false), "said once")
     }
 
     func testAStartThatGetsGoingInTimeIsNoStall() {
         var watch = StallWatch()
         _ = watch.observe(.waitingToPlayAtSpecifiedRate, seekInFlight: false, now: 10)
         XCTAssertEqual(watch.observe(.playing, seekInFlight: false, now: 10.4), .recovered)
-        XCTAssertNil(watch.graceIsOver(now: 14), "it was playing since")
+        XCTAssertNil(watch.graceIsOver(now: 14, seekInFlight: false), "it was playing since")
     }
 
     func testAStartThatWasPausedAgainIsNoStall() {
         var watch = StallWatch()
         _ = watch.observe(.waitingToPlayAtSpecifiedRate, seekInFlight: false, now: 10)
         _ = watch.observe(.paused, seekInFlight: false, now: 11)
-        XCTAssertNil(watch.graceIsOver(now: 14))
+        XCTAssertNil(watch.graceIsOver(now: 14, seekInFlight: false))
     }
 
     func testAWaitThatWasAStallAlreadyIsNotCountedAgainByTheGrace() {
         var watch = StallWatch()
         _ = watch.observe(.playing, seekInFlight: false, now: 0)
         XCTAssertEqual(watch.observe(.waitingToPlayAtSpecifiedRate, seekInFlight: false, now: 5), .stalled)
-        XCTAssertNil(watch.graceIsOver(now: 9))
+        XCTAssertNil(watch.graceIsOver(now: 9, seekInFlight: false))
     }
 
     func testTheWaitOfASeekIsNotAStartThatCounts() {
         var watch = StallWatch()
         _ = watch.observe(.paused, seekInFlight: false, now: 0)
         _ = watch.observe(.waitingToPlayAtSpecifiedRate, seekInFlight: true, now: 1)
-        XCTAssertNil(watch.graceIsOver(now: 9), "a jump that takes long is the jump's business")
+        XCTAssertNil(watch.graceIsOver(now: 9, seekInFlight: true), "a jump that takes long is the jump's business")
+    }
+
+    // MARK: - A wait that outlasts a jump
+
+    func testAWaitThatGoesOnAfterTheJumpHasLandedIsAStartFromThen() {
+        var watch = StallWatch()
+        _ = watch.observe(.playing, seekInFlight: false, now: 0)
+        XCTAssertNil(watch.observe(.waitingToPlayAtSpecifiedRate, seekInFlight: true, now: 5), "during the jump: the jump's wait")
+        XCTAssertNil(watch.graceRemaining(now: 6), "nothing is counted while the jump is on its way")
+        watch.seekLanded(now: 8)
+        XCTAssertEqual(watch.graceRemaining(now: 8), 3, "the player still waits for its first data at the new place: a start")
+        XCTAssertNil(watch.graceIsOver(now: 10.9, seekInFlight: false))
+        XCTAssertEqual(watch.graceIsOver(now: 11, seekInFlight: false), .stalled, "and a start that does not get going is a stall")
+    }
+
+    func testAJumpThatLandsOnAPlayerThatPlaysCountsNothing() {
+        var watch = StallWatch()
+        _ = watch.observe(.playing, seekInFlight: false, now: 0)
+        watch.seekLanded(now: 4)
+        XCTAssertNil(watch.graceRemaining(now: 4))
+    }
+
+    func testTheGraceIsNotLostWhenItIsAskedEarly() {
+        // The clock of the check and the sleep of the task that asks are not the same clock (the device may have slept): early is not "never".
+        var watch = StallWatch()
+        _ = watch.observe(.paused, seekInFlight: false, now: 0)
+        _ = watch.observe(.waitingToPlayAtSpecifiedRate, seekInFlight: false, now: 10)
+        XCTAssertNil(watch.graceIsOver(now: 11, seekInFlight: false))
+        XCTAssertEqual(try XCTUnwrap(watch.graceRemaining(now: 11)), 2, accuracy: 0.001, "it says how long to wait still")
+        XCTAssertEqual(watch.graceIsOver(now: 13, seekInFlight: false), .stalled)
+    }
+
+    func testAGraceThatRunsOutWhileAJumpIsOnItsWayIsNotSpent() {
+        var watch = StallWatch()
+        _ = watch.observe(.paused, seekInFlight: false, now: 0)
+        _ = watch.observe(.waitingToPlayAtSpecifiedRate, seekInFlight: false, now: 10)
+        // The viewer jumps at 12; at 13 the check comes: the state machine is `seeking` and would drop a stall, which would then never be said again.
+        XCTAssertNil(watch.graceIsOver(now: 13, seekInFlight: true))
+        XCTAssertNil(watch.graceRemaining(now: 13), "it is the jump's wait now")
+        watch.seekLanded(now: 14)
+        XCTAssertEqual(watch.graceIsOver(now: 17, seekInFlight: false), .stalled, "counted from the landing")
     }
 }
