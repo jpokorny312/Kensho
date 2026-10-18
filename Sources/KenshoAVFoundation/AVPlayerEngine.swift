@@ -252,7 +252,7 @@ public final class AVPlayerEngine: PlaybackEngine {
     /// Puts the item on `player`, paused: a session starts where it is told to
     /// and plays when the reducer says so. AVPlayer keeps its rate across
     /// `replaceCurrentItem`, so without the pause an item that replaces a
-    /// playing one would play on by itself, from its beginning.
+    /// playing one starts playing by itself.
     private func attachToPlayer(_ session: Session, item: AVPlayerItem) {
         session.stage = .starting
         session.item = item

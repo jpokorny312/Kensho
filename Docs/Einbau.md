@@ -1,6 +1,6 @@
 # Kensho in Ensō
 
-Ersetzt `Adapter-Einbau.md` des Entwurfs („nur auf Syntax geprüft“): so hängt das Paket jetzt wirklich in der App.
+Ersetzt `Adapter-Einbau.md` des Entwurfs („nur auf Syntax geprüft“): so hängt das Paket jetzt wirklich in der App. (Reducer, Coordinator und `AVPlayerEngine` hängen noch **nicht** in der App; die App nutzt Log, Launcher, `PlaylistDiagnostics` und das Routing.)
 
 ## Das Paket im Projekt
 
@@ -26,7 +26,7 @@ Die Diagnose der Playlist (`PlaylistDiagnostics`): iPhone `.full` und mit Warten
 
 ## Prüfen
 
-- `cd Kensho && swift test` — 80 Tests, ohne Gerät: Sitzungen und Rotation des Protokolls, Fehlerketten, Routing, der Reducer samt Wechsel der Qualität, der Controller, die Diagnose der Playlist (gegen eine gespielte Antwort).
+- `cd Kensho && swift test` — 124 Tests, ohne Gerät: Sitzungen und Rotation des Protokolls, Fehlerketten, Routing, der Reducer samt Wechsel der Qualität, der Coordinator, die Diagnose der Playlist (gegen eine gespielte Antwort), `AVPlayerEngine` gegen einen echten `AVPlayer` (erzeugte stumme Dateien).
 - `swift test` im Hauptordner (das Kit) und die UI-Tests des Harness: `Scripts/UITestHarness/run-ios-tests.sh`, `run-tvos-tests.sh`. Die Wege durch den Launcher decken ab: `testAFilmWithEAC3AudioKeepsItsSoundThroughPrismCore`
   (HEVC + E-AC-3 über PrismCore, die Zeile `audio: #1 bridged … master.m3u8`), `testAnHTTPSStreamIsReadThroughTheSystemAndPlays` (der Leser und sein Protokoll), `testAutoAdvanceEndsInThePreparedEpisode` (Vorbereitung der nächsten Folge),
   die CarPlay-Tests; auf der Apple TV `testNextEpisodeIsPreparedBeforeItIsDue` (Vorbereitung ohne Umschalten des Bildschirms). Die HDMI-Umschaltung (`TVDisplayCoordination`) gibt es im Simulator nicht: sie ist gebaut, aber nur auf der
