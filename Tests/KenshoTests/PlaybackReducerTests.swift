@@ -320,6 +320,74 @@ final class PlaybackReducerTests: XCTestCase {
         XCTAssertTrue(fx.isEmpty)
     }
 
+    // MARK: - What the viewer wants survives what the player does
+
+    func testAPauseOrPlayDuringAFailureIsRememberedAndNothingElse() {
+        var (s, fx) = run([.engineFailed(Epoch(1), reason: "boom"), .pause], from: playing())
+        XCTAssertEqual(s.phase, .failed("boom"))
+        XCTAssertFalse(s.wantsPlay, "the viewer pressed pause while the stream was being made again")
+        XCTAssertTrue(fx.isEmpty, "there is nothing to pause: the engine has no session")
+        (s, fx) = run([.play], from: s)
+        XCTAssertTrue(s.wantsPlay)
+        XCTAssertTrue(fx.isEmpty)
+    }
+
+    func testAnIntentWithoutASessionIsStillIgnored() {
+        let (s, fx) = run([.pause, .play, .seek(to: 5)])
+        XCTAssertEqual(s, PlaybackState(), "nothing is loaded: there is nothing to want")
+        XCTAssertTrue(fx.isEmpty)
+        let (stopped, _) = run([.stop, .pause], from: playing())
+        XCTAssertTrue(stopped.wantsPlay == false && stopped.phase == .stopped)
+    }
+
+    func testAReloadIsANewSessionOfTheSameSourceThatKeepsWhatTheViewerWants() {
+        let paused = run([.pause], from: playing()).0
+        let (s, fx) = run([.reload(startAt: 50, selection: TrackSelection(audio: 2), quality: lo)], from: paused)
+        XCTAssertEqual(s.epoch, Epoch(2))
+        XCTAssertEqual(s.phase, .loading)
+        XCTAssertFalse(s.wantsPlay, "a load is the viewer starting something; a reload is the app making the stream again under him")
+        XCTAssertEqual(s.source, source)
+        XCTAssertEqual(s.position, 50)
+        XCTAssertEqual(s.selection, TrackSelection(audio: 2))
+        XCTAssertEqual(s.quality, lo)
+        XCTAssertEqual(fx, [.load(Epoch(2), source, startAt: 50, selection: TrackSelection(audio: 2), quality: lo)])
+        let (ready, readyFx) = run([.engineReady(Epoch(2))], from: s)
+        XCTAssertEqual(ready.phase, .paused, "and it begins paused")
+        XCTAssertFalse(readyFx.contains(.play(Epoch(2))))
+    }
+
+    func testAReloadOfAPlayingFilmPlaysWhenReady() {
+        let (s, fx) = run([.reload(startAt: 10, selection: TrackSelection(), quality: hi), .engineReady(Epoch(2))], from: playing())
+        XCTAssertEqual(s.phase, .playing)
+        XCTAssertEqual(fx.last, .play(Epoch(2)))
+    }
+
+    func testAReloadAfterAFailureRecoversAndKeepsThePause() {
+        let failedWhilePaused = run([.pause, .engineFailed(Epoch(1), reason: "boom")], from: playing()).0
+        let (s, _) = run([.reload(startAt: 123, selection: TrackSelection(audio: 1), quality: hi), .engineReady(Epoch(2))], from: failedWhilePaused)
+        XCTAssertEqual(s.phase, .paused)
+        XCTAssertEqual(s.position, 123)
+    }
+
+    func testAReloadThrowsAReplacementAwayAndLeavesOldReportsStale() {
+        let preparing = run([.requestQuality(lo, now: 100)], from: playing()).0
+        let (s, fx) = run([.reload(startAt: 0, selection: TrackSelection(), quality: hi)], from: preparing)
+        XCTAssertNil(s.swap)
+        XCTAssertEqual(fx.first, .discardSwap(Epoch(2)))
+        XCTAssertEqual(s.epoch, Epoch(3), "the replacement had its number; the new session has the next")
+        let (late, _) = run([.swapPrepared(Epoch(2)), .engineReady(Epoch(1))], from: s)
+        XCTAssertEqual(late.phase, .loading, "reports of the sessions before are dropped")
+    }
+
+    func testAReloadWithNothingLoadedDoesNothing() {
+        let (s, fx) = run([.reload(startAt: 0, selection: TrackSelection(), quality: nil)])
+        XCTAssertEqual(s, PlaybackState())
+        XCTAssertTrue(fx.isEmpty)
+        let (stopped, stopFx) = run([.stop, .reload(startAt: 0, selection: TrackSelection(), quality: nil)], from: playing())
+        XCTAssertEqual(stopped.phase, .stopped, "what ended stays ended")
+        XCTAssertEqual(stopFx.count, 1)
+    }
+
     func testALoadRecoversAFailedPlaybackFromWhereItWas() {
         var (s, _) = run([.engineTick(Epoch(1), position: 123), .engineFailed(Epoch(1), reason: "boom")], from: playing())
         let position = s.position

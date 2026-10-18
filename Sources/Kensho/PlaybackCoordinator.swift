@@ -67,6 +67,10 @@ public final class PlaybackCoordinator {
     ) {
         send(.load(source, startAt: startAt, selection: selection, quality: quality))
     }
+    /// The app makes the stream of what plays again, under the viewer (see `PlaybackEvent.reload`): what he wants stays.
+    public func reload(startAt: TimeInterval, selection: TrackSelection = TrackSelection(), quality: QualityChoice? = nil) {
+        send(.reload(startAt: startAt, selection: selection, quality: quality))
+    }
     public func play() { send(.play) }
     public func pause() { send(.pause) }
     public func seek(to position: TimeInterval) { send(.seek(to: position)) }

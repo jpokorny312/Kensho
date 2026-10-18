@@ -37,7 +37,27 @@ public enum PlaybackReducer {
             s.lostWhileSwapping = nil
             fx.append(.load(s.epoch, source, startAt: s.position, selection: selection, quality: quality))
 
+        case let .reload(startAt, selection, quality):
+            // (Nothing to make again before anything was loaded or after it ended.)
+            guard let source = s.source, s.phase != .idle, s.phase != .stopped else { break }
+            discardSwap(&s, &fx)
+            s.epoch = allocateEpoch(&s)
+            s.phase = .loading
+            s.quality = quality
+            s.selection = selection
+            s.position = max(0, startAt)
+            s.pendingSeek = nil
+            s.pendingSelection = nil
+            s.lostWhileSwapping = nil
+            fx.append(.load(s.epoch, source, startAt: s.position, selection: selection, quality: quality))
+
         case .play:
+            // A failed playback has no engine session, but the viewer still wants what he wants: the stream that is made again begins
+            // (or does not) accordingly.
+            if case .failed = s.phase {
+                s.wantsPlay = true
+                break
+            }
             guard isLive(s) else { break }
             s.wantsPlay = true
             if s.phase == .paused {
@@ -46,6 +66,10 @@ public enum PlaybackReducer {
             }
 
         case .pause:
+            if case .failed = s.phase {
+                s.wantsPlay = false
+                break
+            }
             guard isLive(s) else { break }
             s.wantsPlay = false
             switch s.phase {

@@ -5,6 +5,10 @@ import Foundation
 public enum PlaybackEvent: Equatable, Sendable {
     // Viewer intents.
     case load(MediaSource, startAt: TimeInterval, selection: TrackSelection, quality: QualityChoice?)
+    /// The app makes the stream of what it is playing again, under the viewer: after a failure (a reconnect, a fallback), for a track the stream
+    /// cannot switch live, for a source it re-reads. A new session of the same source, at `startAt`; what the viewer wants stays what it was - a `load`
+    /// is the viewer starting something and wants playback, a reload must not undo a pause.
+    case reload(startAt: TimeInterval, selection: TrackSelection, quality: QualityChoice?)
     case play
     case pause
     case seek(to: TimeInterval)

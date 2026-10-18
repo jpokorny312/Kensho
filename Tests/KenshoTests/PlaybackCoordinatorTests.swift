@@ -136,6 +136,18 @@ final class PlaybackCoordinatorTests: XCTestCase {
         XCTAssertEqual(engine.performed.last, .play(Epoch(2)))
     }
 
+    func testAReloadReachesTheEngineAsAFreshSessionAndKeepsThePause() {
+        let (coordinator, engine) = make()
+        coordinator.load(film)
+        engine.onEvent?(.engineReady(Epoch(1)))
+        coordinator.pause()
+        coordinator.reload(startAt: 42, quality: lo)
+        XCTAssertEqual(engine.performed.last, .load(Epoch(2), film, startAt: 42, selection: TrackSelection(), quality: lo))
+        engine.onEvent?(.engineReady(Epoch(2)))
+        XCTAssertEqual(coordinator.state.phase, .paused)
+        XCTAssertEqual(engine.performed.last, .load(Epoch(2), film, startAt: 42, selection: TrackSelection(), quality: lo), "nothing set it going")
+    }
+
     func testTheCoordinatorDoesNotKeepItsEngineFromGoingAway() {
         weak var weakCoordinator: PlaybackCoordinator?
         let engine = FakeEngine()

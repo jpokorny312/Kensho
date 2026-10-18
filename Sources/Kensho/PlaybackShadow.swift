@@ -118,21 +118,21 @@ public final class PlaybackShadow {
     /// switch that rebuilds the stream). `reason` is the name the app gives the attempt.
     ///
     /// - Parameter startsPlayback: the viewer starts something (the player opens, a new episode): playback is wanted from here. False for a
-    ///   stream the app's policies replace under the viewer's feet: what the viewer wanted stays what it was. (The state machine's `load` always
-    ///   wants playback, so a viewer who had paused is made to want it again here, and the pause is put back.) The app's own `replaceItem` sets
+    ///   stream the app's policies replace under the viewer's feet: what the viewer wanted stays what it was. (A `load` always wants
+    ///   playback, as the viewer starting something does; a `reload` leaves it as it was.) The app's own `replaceItem` sets
     ///   `isPlaying = true` for every item it puts in; where the viewer had paused, the comparison then says so.
     public func begin(item: String, startAt: TimeInterval, quality: String?, audio: Int?, subtitle: Int?, reason: String, startsPlayback: Bool = true) {
         guard !isEnded else { return }
         let before = coordinator.state
-        let keepsThePause = !startsPlayback && !before.wantsPlay && before.source != nil
-        log.log("begin (\(reason)): \(item) at \(Self.seconds(startAt))" + (keepsThePause ? ", the viewer had paused: that stays" : ""), tag: tag)
-        coordinator.load(
-            MediaSource(id: item, range: .sdr),
-            startAt: startAt,
-            selection: TrackSelection(audio: audio, subtitle: subtitle),
-            quality: quality.map { QualityChoice(id: $0, range: .sdr) }
-        )
-        if keepsThePause { coordinator.pause() }
+        let isReload = !startsPlayback && before.source != nil && before.phase != .idle && before.phase != .stopped
+        log.log("begin (\(reason)): \(item) at \(Self.seconds(startAt))" + (isReload && !before.wantsPlay ? ", the viewer had paused: that stays" : ""), tag: tag)
+        let selection = TrackSelection(audio: audio, subtitle: subtitle)
+        let choice = quality.map { QualityChoice(id: $0, range: .sdr) }
+        if isReload && before.source?.id == item {
+            coordinator.send(.reload(startAt: startAt, selection: selection, quality: choice))
+        } else {
+            coordinator.load(MediaSource(id: item, range: .sdr), startAt: startAt, selection: selection, quality: choice)
+        }
     }
 
     /// The player is closed.
@@ -380,10 +380,7 @@ public final class PlaybackShadow {
     /// goes, and the viewer's wish stays what it was.
     private func followAsNewSession() {
         let s = coordinator.state
-        guard let source = s.source else { return }
-        let paused = !s.wantsPlay
-        coordinator.load(source, startAt: s.position, selection: s.selection, quality: s.quality)
-        if paused { coordinator.pause() }
+        coordinator.send(.reload(startAt: s.position, selection: s.selection, quality: s.quality))
     }
 
     // MARK: - Words
@@ -423,6 +420,7 @@ public final class PlaybackShadow {
             return "load \(source.id) at \(seconds(startAt))\(describe(selection))" + (quality.map { ", quality \($0.id)" } ?? "")
         case .play: return "play"
         case .pause: return "pause"
+        case let .reload(startAt, selection, quality): return "reload at \(seconds(startAt))\(describe(selection))" + (quality.map { ", quality \($0.id)" } ?? "")
         case let .seek(target): return "seek to \(seconds(target))"
         case let .selectAudio(track): return "audio \(track.map { "#\($0)" } ?? "default")"
         case let .selectSubtitle(track): return "subtitles \(track.map { "#\($0)" } ?? "off")"
