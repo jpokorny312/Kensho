@@ -22,11 +22,30 @@ public final class AVPlayerEngine: PlaybackEngine {
     public var onEvent: ((PlaybackEvent) -> Void)?
     public let player: AVPlayer
 
-    /// Resolves what to hand AVPlayer for a source at a quality. Typically
-    /// starts the PrismCore session (or builds the server URL) and returns
-    /// the item for the playlist address. Throwing reports a failure for that
-    /// epoch.
-    public typealias ItemProvider = @MainActor (MediaSource, QualityChoice?) async throws -> AVPlayerItem
+    /// What the provider is asked for: a source at a quality, wanted at a position and with these tracks. A stream that can begin where it is
+    /// wanted need not begin at the start and be jumped; a server's transcode has the tracks in its address.
+    public struct ItemRequest: Equatable, Sendable {
+        public var source: MediaSource
+        public var quality: QualityChoice?
+        /// Where the item is wanted: the start position of a load, and for a replacement the position when it was asked for (the engine
+        /// jumps to the exact one when the replacement takes over).
+        public var startAt: TimeInterval
+        public var selection: TrackSelection
+
+        public init(source: MediaSource, quality: QualityChoice?, startAt: TimeInterval, selection: TrackSelection) {
+            self.source = source
+            self.quality = quality
+            self.startAt = startAt
+            self.selection = selection
+        }
+    }
+
+    /// Resolves what to hand AVPlayer for a request. Typically starts the
+    /// PrismCore session (or builds the server URL) and returns the item for
+    /// the playlist address. It must be an item that is on no player: AVFoundation
+    /// raises an exception that nothing in Swift can catch for one that is. Throwing
+    /// reports a failure for that epoch.
+    public typealias ItemProvider = @MainActor (ItemRequest) async throws -> AVPlayerItem
     /// Applies the viewer's track choice to an item. The default maps the
     /// numbers to option positions inside AVFoundation's audible and legible
     /// groups; an app that maps stream indices differently passes its own.
@@ -103,11 +122,13 @@ public final class AVPlayerEngine: PlaybackEngine {
     /// Where a replacement's item gets ready. An item loads only on a player,
     /// and `player` is busy.
     private lazy var staging: AVPlayer = {
+        isStagingCreated = true
         let staging = AVPlayer()
         staging.isMuted = true
         staging.allowsExternalPlayback = false
         return staging
     }()
+    private var isStagingCreated = false
     private var rateObservation: NSKeyValueObservation?
     private var rateChangeObserver: NSObjectProtocol?
     /// What the engine last asked of the player: playing or not. A rate that is something else was changed by someone else.
@@ -168,10 +189,12 @@ public final class AVPlayerEngine: PlaybackEngine {
                 onEvent?(.engineFailed(epoch, reason: "no prepared session \(epoch.rawValue) to take over from \(replacing.rawValue)"))
                 return
             }
+            // Where the player is, not where the last tick said: the reducer's position is up to half a second old.
+            let measured = player.currentTime().seconds
             replacement = nil
             endLive()
             live = session
-            session.startAt = at
+            session.startAt = measured.isFinite && abs(measured - at) < 5 ? measured : at
             session.selection = selection
             // The prepared item has done its job - it proved on the staging player that the stream
             // loads - and cannot go any further: AVFoundation refuses an item that has been on one
@@ -239,8 +262,12 @@ public final class AVPlayerEngine: PlaybackEngine {
         session.resolveTask = Task { [weak self, weak session] in
             guard let self, let session else { return }
             do {
-                let item = try await self.provider(source, quality)
+                let item = try await self.provider(ItemRequest(source: source, quality: quality, startAt: session.startAt, selection: session.selection))
                 guard !Task.isCancelled, self.isCurrent(session) else { return }
+                if item === self.player.currentItem || (self.isStagingCreated && item === self.staging.currentItem) {
+                    self.fail(session, reason: "the provider returned an item that is on a player already")
+                    return
+                }
                 if session === self.live {
                     self.attachToPlayer(session, item: item)
                 } else {
@@ -290,11 +317,13 @@ public final class AVPlayerEngine: PlaybackEngine {
     /// is ready can still fail, and a stream that dies while it plays is the
     /// failure that matters most.
     private func observeStatus(of session: Session, item: AVPlayerItem) {
-        session.statusObservation = item.observe(\.status, options: [.initial, .new]) { [weak self, weak session] item, _ in
-            let status = item.status
-            let error = item.error
+        session.statusObservation = item.observe(\.status, options: [.initial, .new]) { [weak self, weak session] observed, _ in
+            let status = observed.status
+            let error = observed.error
             Task { @MainActor in
-                guard let self, let session, self.isCurrent(session) else { return }
+                // (The item the report is about is the one the session has: a report of the item on the staging player that is still on its way when
+                // the session has taken a copy over is no report about the copy.)
+                guard let self, let session, session.item === observed, self.isCurrent(session) else { return }
                 self.itemStatusChanged(session, status: status, error: error)
             }
         }
@@ -320,7 +349,7 @@ public final class AVPlayerEngine: PlaybackEngine {
         session.startTask = Task { [weak self, weak session] in
             guard let self, let session else { return }
             if session.startAt > 0 {
-                let time = CMTime(seconds: session.startAt, preferredTimescale: 600)
+                let time = CMTime(seconds: self.clamped(session.startAt, in: item), preferredTimescale: 600)
                 var landed = false
                 for _ in 0..<Self.maxSeekAttempts where !landed {
                     landed = await item.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero)
@@ -342,7 +371,7 @@ public final class AVPlayerEngine: PlaybackEngine {
         guard var request = session.seek else { return }
         request.attempts += 1
         session.seek = request
-        let time = CMTime(seconds: request.target, preferredTimescale: 600)
+        let time = CMTime(seconds: clamped(request.target, in: session.item), preferredTimescale: 600)
         // Zero tolerance: a keyframe-snapped seek lands a few seconds
         // off the target and the picture jumps back after it.
         player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self, weak session] finished in
@@ -442,6 +471,14 @@ public final class AVPlayerEngine: PlaybackEngine {
                 if self?.reportTheGraceIfOver() == true { return }
             }
         }
+    }
+
+    /// `seconds`, cut to what the item can seek to (see `SeekTarget`).
+    private func clamped(_ seconds: TimeInterval, in item: AVPlayerItem?) -> TimeInterval {
+        guard let item else { return seconds }
+        let ends = item.seekableTimeRanges.map(\.timeRangeValue).filter { $0.isValid && !$0.isEmpty }.map { CMTimeRangeGetEnd($0).seconds }.filter { $0.isFinite }
+        let duration = item.duration
+        return SeekTarget.clamped(seconds, seekableEnd: ends.max(), duration: duration.isNumeric ? duration.seconds : nil)
     }
 
     private func graceRemaining() -> TimeInterval? {

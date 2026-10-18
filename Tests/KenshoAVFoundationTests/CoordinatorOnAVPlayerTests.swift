@@ -27,7 +27,8 @@ private final class Rig {
         player.isMuted = true
         engine = AVPlayerEngine(
             player: player,
-            provider: { [weak self] source, quality in
+            provider: { [weak self] request in
+                let source = request.source, quality = request.quality
                 guard let self, let url = self.files[quality.map { "\(source.id)-\($0.id)" } ?? source.id] ?? self.files[source.id] else {
                     throw CocoaError(.fileNoSuchFile)
                 }

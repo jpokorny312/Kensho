@@ -16,6 +16,8 @@ private final class EngineHarness {
     private(set) var engine: AVPlayerEngine!
     private(set) var events: [PlaybackEvent] = []
     private(set) var provided: [(MediaSource, QualityChoice?)] = []
+    /// What the provider was asked, whole.
+    private(set) var requests: [AVPlayerEngine.ItemRequest] = []
     /// Files by name; the default provider maps `source.id` (or `source.id-quality.id`) to one.
     var files: [String: URL] = [:]
     /// What the provider does, per call. Replaced by tests that need a slow or failing one.
@@ -26,10 +28,12 @@ private final class EngineHarness {
         player.isMuted = true
         engine = AVPlayerEngine(
             player: player,
-            provider: { [weak self] source, quality in
+            provider: { [weak self] request in
                 // (A session the test has left may still ask: nothing is there to answer.)
                 guard let self else { throw Failure.noItem("the test is over") }
+                let source = request.source, quality = request.quality
                 self.provided.append((source, quality))
+                self.requests.append(request)
                 if let make = self.make { return try await make(source, quality) }
                 let key = quality.map { "\(source.id)-\($0.id)" } ?? source.id
                 guard let url = self.files[key] ?? self.files[source.id] else { throw Failure.noItem(key) }
@@ -179,6 +183,48 @@ final class AVPlayerEngineTests: XCTestCase {
         XCTAssertFalse(h.events.contains(.pause) || h.events.contains(.play), "an echo would turn every instruction into an intent: \(h.events)")
     }
 
+    // MARK: - What the provider is told
+
+    func testTheProviderIsToldWhereTheItemIsWantedAndWithWhichTracks() async throws {
+        let h = try harness()
+        h.engine.perform(.load(Epoch(1), film, startAt: 12, selection: TrackSelection(audio: 2, subtitle: 3), quality: QualityChoice(id: "hi", range: .sdr)))
+        await h.waitFor(.engineReady(Epoch(1)))
+        XCTAssertEqual(h.requests.last?.startAt, 12, "a stream can begin where it is wanted instead of at the start and a jump after it")
+        XCTAssertEqual(h.requests.last?.selection, TrackSelection(audio: 2, subtitle: 3), "a server's transcode has its tracks in the address")
+        h.engine.perform(.play(Epoch(1)))
+        h.engine.perform(.prepareSwap(Epoch(2), QualityChoice(id: "lo", range: .sdr), startAt: 15, selection: TrackSelection(audio: 2, subtitle: 3)))
+        await h.waitFor(.swapPrepared(Epoch(2)))
+        XCTAssertEqual(h.requests.last?.startAt, 15)
+        XCTAssertEqual(h.requests.last?.quality?.id, "lo")
+    }
+
+    func testAReplacementBeginsWhereThePlayerIsAndNotWhereTheLastTickWas() async throws {
+        let h = try harness()
+        h.engine.perform(.load(Epoch(1), film, startAt: 0, selection: none, quality: nil))
+        await h.waitFor(.engineReady(Epoch(1)))
+        h.engine.perform(.play(Epoch(1)))
+        await h.wait { (h.lastTick(of: Epoch(1)) ?? 0) > 1.4 }
+        h.engine.perform(.prepareSwap(Epoch(2), QualityChoice(id: "lo", range: .sdr), startAt: 0, selection: none))
+        await h.waitFor(.swapPrepared(Epoch(2)))
+        let playerIsAt = h.player.currentTime().seconds
+        // The reducer knows the position of the last tick (up to half a second old); the engine reads the player itself.
+        h.engine.perform(.commitSwap(Epoch(2), replacing: Epoch(1), at: playerIsAt - 0.4, selection: none))
+        await h.waitFor(.swapFinished(Epoch(2)))
+        XCTAssertEqual(h.player.currentTime().seconds, playerIsAt, accuracy: 0.15, "no half second that was seen twice")
+    }
+
+    func testAnItemThatIsOnAPlayerAlreadyIsRefusedInsteadOfCrashingTheProcess() async throws {
+        let h = try harness()
+        h.engine.perform(.load(Epoch(1), film, startAt: 0, selection: none, quality: nil))
+        await h.waitFor(.engineReady(Epoch(1)))
+        let onThePlayer = try XCTUnwrap(h.player.currentItem)
+        // AVFoundation raises NSInvalidArgumentException for an item on a second player, and nothing in Swift catches it.
+        h.make = { _, _ in onThePlayer }
+        h.engine.perform(.prepareSwap(Epoch(2), QualityChoice(id: "lo", range: .sdr), startAt: 0, selection: none))
+        let failed = await h.wait { h.events.contains { if case .swapFailed(Epoch(2), _) = $0 { return true } else { return false } } }
+        XCTAssertTrue(failed, "events: \(h.events)")
+    }
+
     // MARK: - Seeking
 
     func testASeekLandsAndIsReportedWithItsToken() async throws {
@@ -215,6 +261,26 @@ final class AVPlayerEngineTests: XCTestCase {
         let answered = await h.wait { h.events.contains(.seekFinished(Epoch(1), SeekToken(1))) || h.events.contains { if case .engineFailed = $0 { return true } else { return false } } }
         XCTAssertTrue(answered, "events: \(h.events)")
         XCTAssertEqual(h.player.currentTime().seconds, 5, accuracy: 0.2, "the seek that was asked for is the one that is carried out")
+    }
+
+    func testAJumpBeyondTheEndOfTheItemLandsAtItsEnd() async throws {
+        let h = try harness()
+        h.engine.perform(.load(Epoch(1), film, startAt: 0, selection: none, quality: nil))
+        await h.waitFor(.engineReady(Epoch(1)))
+        h.engine.perform(.seek(Epoch(1), SeekToken(1), to: 5_000))   // the film has 30 s
+        let landed = await h.wait { h.events.contains(.seekFinished(Epoch(1), SeekToken(1))) || h.events.contains { if case .engineFailed = $0 { return true } else { return false } } }
+        XCTAssertTrue(landed, "events: \(h.events)")
+        XCTAssertTrue(h.events.contains(.seekFinished(Epoch(1), SeekToken(1))), "a target past the end is no failure of the session: \(h.events)")
+        XCTAssertLessThanOrEqual(h.player.currentTime().seconds, 30.1)
+        XCTAssertGreaterThan(h.player.currentTime().seconds, 29, "it went to the end")
+    }
+
+    func testAStartPositionBeyondTheEndOfTheItemIsNoFailureEither() async throws {
+        let h = try harness()
+        h.engine.perform(.load(Epoch(1), film, startAt: 5_000, selection: none, quality: nil))
+        let ready = await h.wait { h.events.contains(.engineReady(Epoch(1))) || h.events.contains { if case .engineFailed = $0 { return true } else { return false } } }
+        XCTAssertTrue(ready, "events: \(h.events)")
+        XCTAssertTrue(h.events.contains(.engineReady(Epoch(1))), "events: \(h.events)")
     }
 
     // MARK: - Tracks
