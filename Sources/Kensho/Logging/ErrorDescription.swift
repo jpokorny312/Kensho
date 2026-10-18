@@ -1,6 +1,7 @@
 import Foundation
 
-/// An error written out in full, for a log that is read a week later.
+/// An error written out in full, for a log that is read a week later. Every word of it that the error brought along goes through
+/// `LogRedaction.text`: an address that failed carries the access token of the stream.
 public enum ErrorDescription {
     /// Full recursive error chain - domain, code, localized description,
     /// failure reason, recovery suggestion, and every remaining userInfo
@@ -21,17 +22,17 @@ public enum ErrorDescription {
                 lines.append("\(indent)    known meaning: \(known)")
             }
             if !err.localizedDescription.isEmpty {
-                lines.append("\(indent)    description: \(err.localizedDescription)")
+                lines.append("\(indent)    description: \(LogRedaction.text(err.localizedDescription))")
             }
             if let reason = err.localizedFailureReason {
-                lines.append("\(indent)    failureReason: \(reason)")
+                lines.append("\(indent)    failureReason: \(LogRedaction.text(reason))")
             }
             if let suggestion = err.localizedRecoverySuggestion {
-                lines.append("\(indent)    recoverySuggestion: \(suggestion)")
+                lines.append("\(indent)    recoverySuggestion: \(LogRedaction.text(suggestion))")
             }
             let skip: Set<String> = [NSUnderlyingErrorKey, NSLocalizedDescriptionKey, NSLocalizedFailureReasonErrorKey, NSLocalizedRecoverySuggestionErrorKey]
             for key in err.userInfo.keys.sorted() where !skip.contains(key) {
-                lines.append("\(indent)    \(key): \(String(describing: err.userInfo[key]!))")
+                lines.append("\(indent)    \(key): \(LogRedaction.text(String(describing: err.userInfo[key]!)))")
             }
             current = err.userInfo[NSUnderlyingErrorKey] as? NSError
             depth += 1

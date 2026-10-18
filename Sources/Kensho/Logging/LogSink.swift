@@ -82,4 +82,45 @@ public enum LogRedaction {
         parts.password = nil
         return parts.string ?? "(unparseable address)"
     }
+
+    /// `text` with every web address in it cut down as `address` does, and a token named as one (`api_key=`, `X-Emby-Token:`, ...) hidden wherever it
+    /// stands. An error carries the address that failed along - in its description, in its `userInfo` - and the address of a stream carries the
+    /// access token: an error written out for a log must not bring it into the file, which is shared for diagnosis.
+    public static func text(_ text: String) -> String {
+        var result = text
+        if result.contains("://"), let expression = try? NSRegularExpression(pattern: #"https?://[^\s"'<>\)\]]+"#) {
+            var cut = ""
+            var last = result.startIndex
+            let length = (result as NSString).length
+            for match in expression.matches(in: result, range: NSRange(location: 0, length: length)) {
+                guard let range = Range(match.range, in: result) else { continue }
+                cut += result[last..<range.lowerBound]
+                var found = String(result[range])
+                // (A full stop or a comma after the address belongs to the sentence.)
+                var tail = ""
+                while let end = found.last, ".,;:!?".contains(end) {
+                    tail.insert(end, at: tail.startIndex)
+                    found.removeLast()
+                }
+                cut += (URL(string: found).map(address) ?? cutByHand(found)) + tail
+                last = range.upperBound
+            }
+            cut += result[last...]
+            result = cut
+        }
+        if let named = try? NSRegularExpression(pattern: #"(?i)\b(api_?key|access_?token|x-emby-token|token|authorization)(\s*[=:]\s*)[^\s&"',;]+"#) {
+            result = named.stringByReplacingMatches(in: result, range: NSRange(location: 0, length: (result as NSString).length), withTemplate: "$1$2<hidden>")
+        }
+        return result
+    }
+
+    /// An address that `URL` will not take, cut at its query and fragment and without what stands before an `@` in it.
+    private static func cutByHand(_ address: String) -> String {
+        var cut = String(address.prefix { $0 != "?" && $0 != "#" })
+        if let scheme = cut.range(of: "://"), let at = cut.lastIndex(of: "@"), at > scheme.upperBound,
+           !cut[scheme.upperBound..<at].contains("/") {
+            cut.removeSubrange(scheme.upperBound...at)
+        }
+        return cut
+    }
 }

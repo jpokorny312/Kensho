@@ -178,7 +178,43 @@ final class LogTests: XCTestCase {
     }
 }
 
+final class RedactionOfTextTests: XCTestCase {
+    func testEveryAddressInATextIsCutDownAndTheRestIsLeftAlone() {
+        let text = "failed https://user:secret@media.example:8920/Videos/42/stream?api_key=TOKEN&static=true#frag, then http://other.example/x?k=v. Done."
+        XCTAssertEqual(LogRedaction.text(text), "failed https://media.example:8920/Videos/42/stream, then http://other.example/x. Done.")
+    }
+
+    func testATextWithoutAnAddressIsNotTouched() {
+        XCTAssertEqual(LogRedaction.text("The operation could not be completed"), "The operation could not be completed")
+        XCTAssertEqual(LogRedaction.text("file:///var/mobile/Documents/film.mkv"), "file:///var/mobile/Documents/film.mkv", "a path on the device carries no token")
+    }
+
+    func testATokenOutsideAnAddressIsHiddenToo() {
+        let text = LogRedaction.text("headers: X-Emby-Token: abc123, api_key=def456&x=1 authorization=Bearer-ghi")
+        XCTAssertFalse(text.contains("abc123") || text.contains("def456") || text.contains("ghi"), text)
+    }
+}
+
 final class ErrorDescriptionTests: XCTestCase {
+    func testAnErrorThatCarriesTheAddressThatFailedNeverWritesItsToken() {
+        let failing = URL(string: "https://media.example:8920/Videos/42/stream?api_key=SECRETTOKEN&static=true")!
+        let inner = NSError(domain: NSURLErrorDomain, code: -1008, userInfo: [
+            NSURLErrorFailingURLErrorKey: failing,
+            NSURLErrorFailingURLStringErrorKey: failing.absoluteString,
+            NSLocalizedDescriptionKey: "resource unavailable: \(failing.absoluteString)",
+        ])
+        let outer = NSError(domain: "AVFoundationErrorDomain", code: -11800, userInfo: [
+            NSLocalizedDescriptionKey: "The operation could not be completed",
+            NSLocalizedFailureReasonErrorKey: "could not open \(failing.absoluteString)",
+            NSUnderlyingErrorKey: inner,
+            "request": "GET \(failing.absoluteString)",
+        ])
+        let text = ErrorDescription.describe(outer)
+        XCTAssertFalse(text.contains("SECRETTOKEN"), text)
+        XCTAssertTrue(text.contains("https://media.example:8920/Videos/42/stream"), "the address stays, so the log still says what failed: \(text)")
+    }
+
+
     func testNilIsSaidPlainly() {
         XCTAssertEqual(ErrorDescription.describe(nil), "(nil)")
     }
