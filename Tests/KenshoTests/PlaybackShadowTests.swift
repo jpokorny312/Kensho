@@ -292,6 +292,16 @@ final class PlaybackShadowTests: XCTestCase {
         XCTAssertFalse(memory.contains("DEVIATION"), "lines: \(memory.lines)")
     }
 
+    func testAFailureIsNamedByItsDomainAndCodeAndAQualityByItsCap() {
+        let shadow = makeShadow()
+        startedPlaying(shadow)
+        shadow.playerFailed(error: NSError(domain: "CoreMediaErrorDomain", code: -16170))
+        XCTAssertEqual(shadow.state.phase, .failed("CoreMediaErrorDomain -16170"))
+        XCTAssertEqual(PlaybackShadow.qualityName(capMbps: nil), "original")
+        XCTAssertEqual(PlaybackShadow.qualityName(capMbps: 4), "4Mbps")
+        XCTAssertEqual(PlaybackShadow.qualityName(capMbps: 2.5), "2.5Mbps")
+    }
+
     func testNothingHappensAfterTheEnd() {
         let shadow = makeShadow()
         startedPlaying(shadow)

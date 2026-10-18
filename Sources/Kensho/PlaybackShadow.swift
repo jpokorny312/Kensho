@@ -182,6 +182,11 @@ public final class PlaybackShadow {
         coordinator.send(.swapFailed(swap.epoch, reason: why))
     }
 
+    /// The name a stream of a bitrate cap goes by in the state machine and in the log: "original" for none.
+    public static func qualityName(capMbps: Double?) -> String {
+        capMbps.map { String(format: "%gMbps", $0) } ?? "original"
+    }
+
     // MARK: - What the player says
 
     public func playerIsReady() {
@@ -193,6 +198,11 @@ public final class PlaybackShadow {
     public func playerFailed(_ reason: String) {
         guard !isEnded else { return }
         coordinator.send(.engineFailed(coordinator.state.epoch, reason: reason))
+    }
+
+    /// The player failed with this error: the domain and the code say it in a line (the whole chain is in the app's log at that point).
+    public func playerFailed(error: NSError?) {
+        playerFailed(error.map { "\($0.domain) \($0.code)" } ?? "unknown error")
     }
 
     public func playerStalled() { guard !isEnded else { return }; coordinator.send(.engineStalled(coordinator.state.epoch)) }
