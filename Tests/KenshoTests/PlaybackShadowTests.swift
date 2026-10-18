@@ -216,15 +216,61 @@ final class PlaybackShadowTests: XCTestCase {
         XCTAssertEqual(memory.count("DEVIATION phase"), 0, "one cause, one line")
     }
 
-    func testAnAppThatPlaysOnAfterReplacingTheStreamOfAPausedViewerIsCaughtAtOnce() {
+    func testAnAppThatPlaysOnAfterReplacingTheStreamOfAPausedViewerIsNamedAsTheCauseAndReportedWhenItLasts() {
         let shadow = makeShadow()
         startedPlaying(shadow)
         shadow.pause()
         shadow.begin(item: "film", startAt: 50, quality: "original", audio: 1, subtitle: nil, reason: "rebuild", startsPlayback: false)
-        // The app's replaceItem sets isPlaying = true as its last line: it is known at once, not after it has lasted.
+        // The app's replaceItem sets isPlaying = true as its last line.
         shadow.replacementPlays(true)
-        XCTAssertTrue(memory.contains("DEVIATION replacement-resumes"), "lines: \(memory.lines)")
-        XCTAssertEqual(shadow.deviationCount, 1)
+        XCTAssertTrue(memory.contains("the app plays on after replacing the stream"), "lines: \(memory.lines)")
+        XCTAssertFalse(memory.contains("DEVIATION"), "a line that names the cause and no loss yet - the app may set the pause back: \(memory.lines)")
+        XCTAssertEqual(shadow.deviationCount, 0)
+        // It does not: the viewer is playing again, which he did not ask for.
+        shadow.playerIsReady()
+        for _ in 0..<6 {
+            now += 0.5
+            shadow.compare(with: app(wantsToPlay: true, position: 50))
+        }
+        XCTAssertTrue(memory.contains("DEVIATION wants-play"), "lines: \(memory.lines)")
+        XCTAssertTrue(memory.contains("replaced under the viewer's pause"), "and it says why: \(memory.lines)")
+        XCTAssertEqual(shadow.deviationCount, 1, "one cause, one line")
+    }
+
+    func testAnAppThatSetsThePauseBackAtOnceLosesTheViewerNothing() {
+        let shadow = makeShadow()
+        startedPlaying(shadow)
+        shadow.pause()
+        shadow.begin(item: "film", startAt: 50, quality: "original", audio: 1, subtitle: nil, reason: "rebuild", startsPlayback: false)
+        shadow.replacementPlays(true)
+        // What the Apple TV does after the trip through the background: player.pause() a moment after the replacement.
+        now += 0.016
+        shadow.pause()
+        XCTAssertTrue(memory.contains("set the viewer's pause back"), "lines: \(memory.lines)")
+        shadow.playerIsReady()
+        XCTAssertEqual(shadow.state.phase, .paused)
+        for _ in 0..<8 {
+            now += 0.5
+            shadow.compare(with: app(wantsToPlay: false, position: 50))
+        }
+        XCTAssertFalse(memory.contains("DEVIATION"), "lines: \(memory.lines)")
+        XCTAssertEqual(shadow.deviationCount, 0)
+    }
+
+    func testTheViewerPlayingAfterTheReplacementEndsTheCause() {
+        let shadow = makeShadow()
+        startedPlaying(shadow)
+        shadow.pause()
+        shadow.begin(item: "film", startAt: 50, quality: "original", audio: 1, subtitle: nil, reason: "rebuild", startsPlayback: false)
+        shadow.replacementPlays(true)
+        shadow.play()           // he wants it now
+        shadow.playerIsReady()
+        for _ in 0..<8 {
+            now += 0.5
+            shadow.compare(with: app(wantsToPlay: true, position: 50))
+        }
+        XCTAssertFalse(memory.contains("DEVIATION"), "lines: \(memory.lines)")
+        XCTAssertFalse(memory.contains("set the viewer's pause back"), "he pressed play; the app did not take anything back")
     }
 
     func testAReplacementThatLeavesTheViewerWhereHeWasIsNoDeviation() {

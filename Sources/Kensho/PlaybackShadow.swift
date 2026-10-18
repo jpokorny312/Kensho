@@ -73,6 +73,8 @@ public final class PlaybackShadow {
     private var phaseSince: TimeInterval = 0
     private var lastHeartbeat: TimeInterval = -.infinity
     private var isEnded = false
+    /// When the app put a new item in and played on under a viewer who had paused - until it sets the pause back or the viewer plays.
+    private var resumedByReplacementAt: TimeInterval?
 
     /// Disagreements that are going on: since when, and whether they have been written down (they are once they have lasted long enough).
     private struct OpenDeviation {
@@ -146,8 +148,20 @@ public final class PlaybackShadow {
         log.log("end: \(eventCount) events, \(ignoredCount) of them without effect, \(deviationCount) deviations", tag: tag)
     }
 
-    public func play() { guard !isEnded else { return }; coordinator.play() }
-    public func pause() { guard !isEnded else { return }; coordinator.pause() }
+    public func play() {
+        guard !isEnded else { return }
+        resumedByReplacementAt = nil
+        coordinator.play()
+    }
+
+    public func pause() {
+        guard !isEnded else { return }
+        if let at = resumedByReplacementAt {
+            resumedByReplacementAt = nil
+            log.log("the app set the viewer's pause back \(Self.seconds(clock() - at)) after the replacement", tag: tag)
+        }
+        coordinator.pause()
+    }
     public func seek(to position: TimeInterval) { guard !isEnded else { return }; coordinator.seek(to: position) }
     public func selectAudio(_ stream: Int?) { guard !isEnded else { return }; coordinator.selectAudio(stream) }
     public func selectSubtitle(_ stream: Int?) { guard !isEnded else { return }; coordinator.selectSubtitle(stream) }
@@ -174,13 +188,16 @@ public final class PlaybackShadow {
         coordinator.send(.swapPrepared(swap.epoch))
     }
 
-    /// The app has put a new item in and says whether it plays on - its `replaceItem` always does. Where the viewer had paused, that is the loss this
-    /// state machine exists to prevent (a reconnect, a rebuild or a swap undoes his pause), and it is said at once: the comparison that runs with the
-    /// ticks only reports what lasts, and the app sets the flag back some moments later.
+    /// The app has put a new item in and says whether it plays on - its `replaceItem` always does. Where the viewer had paused, that undoes his pause
+    /// (a reconnect, a rebuild, a swap), and the state machine keeps it. Whether that is a loss depends on what the app does next, so this is a line
+    /// that names the cause and no deviation: a call site that sets the pause back at once costs the viewer nothing (the Apple TV does after the trip
+    /// through the background: 16 ms in the first run that showed it), one that does not leaves him playing, and the comparison reports that as
+    /// `wants-play` once it has lasted - with the replacement as its cause.
     public func replacementPlays(_ appPlays: Bool) {
         guard !isEnded, appPlays, !coordinator.state.wantsPlay else { return }
-        deviationCount += 1
-        log.log("DEVIATION replacement-resumes: the app plays on after replacing the stream, the viewer had paused (the state machine keeps his pause, \(Self.phase(coordinator.state.phase)))", tag: tag)
+        resumedByReplacementAt = clock()
+        log.log("the app plays on after replacing the stream, the viewer had paused (the state machine keeps his pause, \(Self.phase(coordinator.state.phase))): "
+                + "it is a loss unless the app sets the pause back", tag: tag)
     }
 
     /// The app calls the change off after it began it (the old stream recovered, the player was changed meanwhile, resolving failed).
@@ -249,6 +266,9 @@ public final class PlaybackShadow {
 
         if app.wantsToPlay != s.wantsPlay {
             found["wants-play"] = "the app wants to play: \(app.wantsToPlay); the state machine: \(s.wantsPlay) (it is \(Self.phase(s.phase)))"
+                + (resumedByReplacementAt.map { " - the stream was replaced under the viewer's pause \(Self.seconds(now - $0)) ago and the app did not set it back" } ?? "")
+        } else {
+            resumedByReplacementAt = nil
         }
         if let source = s.source, source.id != app.itemId {
             found["item"] = "the app plays \(app.itemId); the state machine \(source.id)"
