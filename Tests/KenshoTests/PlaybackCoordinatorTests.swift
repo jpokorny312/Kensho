@@ -139,7 +139,7 @@ final class PlaybackCoordinatorTests: XCTestCase {
     func testTheCoordinatorDoesNotKeepItsEngineFromGoingAway() {
         weak var weakCoordinator: PlaybackCoordinator?
         let engine = FakeEngine()
-        autoreleasepool {
+        do {
             let coordinator = PlaybackCoordinator(engine: engine)
             weakCoordinator = coordinator
         }
