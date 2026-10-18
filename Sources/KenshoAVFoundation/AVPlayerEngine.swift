@@ -513,21 +513,27 @@ public final class AVPlayerEngine: PlaybackEngine {
         return "\(error.domain) \(error.code): \(error.localizedDescription)"
     }
 
-    /// Option positions inside the audible and legible groups. A `nil` audio
-    /// choice leaves AVFoundation's own pick alone (going back from a chosen
-    /// track to "no choice" is not undone: an app that offers that passes its
-    /// own applier); a `nil` subtitle turns subtitles off.
-    private static let defaultApplier: SelectionApplier = { item, selection in
+    /// Option positions inside the audible and legible groups.
+    ///
+    /// - Audio: a number selects that option; a number the stream has no option for changes nothing (what the viewer had stays); `nil` is "no
+    ///   choice" and hands the group back to AVFoundation - an explicit choice stays in force until that is said (AVPlayerItem.h,
+    ///   `selectMediaOptionAutomatically(in:)`), so without it the state machine says "default" while the player plays the track the viewer chose.
+    /// - Subtitles: a number selects that option (an out-of-range one changes nothing - it used to turn the subtitles off); `nil` is "off", said only
+    ///   when something is on and the group can be empty (AVMediaSelectionGroup.allowsEmptySelection), so that a plain start does not make "off"
+    ///   an explicit choice that keeps AVFoundation from showing forced subtitles.
+    static let defaultApplier: SelectionApplier = { item, selection in
         let asset = item.asset
-        if let index = selection.audio,
-           let group = try? await asset.loadMediaSelectionGroup(for: .audible),
-           group.options.indices.contains(index) {
-            item.select(group.options[index], in: group)
+        if let group = try? await asset.loadMediaSelectionGroup(for: .audible) {
+            if let index = selection.audio {
+                if group.options.indices.contains(index) { item.select(group.options[index], in: group) }
+            } else {
+                item.selectMediaOptionAutomatically(in: group)
+            }
         }
         if let group = try? await asset.loadMediaSelectionGroup(for: .legible) {
-            if let index = selection.subtitle, group.options.indices.contains(index) {
-                item.select(group.options[index], in: group)
-            } else {
+            if let index = selection.subtitle {
+                if group.options.indices.contains(index) { item.select(group.options[index], in: group) }
+            } else if group.allowsEmptySelection, item.currentMediaSelection.selectedMediaOption(in: group) != nil {
                 item.select(nil, in: group)
             }
         }

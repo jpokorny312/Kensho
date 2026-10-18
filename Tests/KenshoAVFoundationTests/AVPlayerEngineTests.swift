@@ -283,6 +283,71 @@ final class AVPlayerEngineTests: XCTestCase {
         XCTAssertTrue(h.events.contains(.engineReady(Epoch(1))), "events: \(h.events)")
     }
 
+    // MARK: - The default applier on a real group
+
+    /// The movie with the English and the German track, as an item with its group.
+    private func itemWithTwoAudioTracks(_ directory: URL) async throws -> (item: AVPlayerItem, group: AVMediaSelectionGroup) {
+        let url = try await TestMedia.silentMovieWithTwoAudioTracks(seconds: 10, in: directory, name: "two")
+        let item = AVPlayerItem(url: url)
+        let loaded = try await item.asset.loadMediaSelectionGroup(for: .audible)
+        let group = try XCTUnwrap(loaded)
+        XCTAssertEqual(group.options.count, 2, "English and German")
+        return (item, group)
+    }
+
+    private func selected(_ item: AVPlayerItem, _ group: AVMediaSelectionGroup) -> AVMediaSelectionOption? {
+        item.currentMediaSelection.selectedMediaOption(in: group)
+    }
+
+    func testTheDefaultApplierSelectsTheAudioOptionAtTheNumber() async throws {
+        let directory = try TestMedia.makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let (item, group) = try await itemWithTwoAudioTracks(directory)
+        await AVPlayerEngine.defaultApplier(item, TrackSelection(audio: 1))
+        XCTAssertEqual(selected(item, group)?.extendedLanguageTag, "de")
+        await AVPlayerEngine.defaultApplier(item, TrackSelection(audio: 0))
+        XCTAssertEqual(selected(item, group)?.extendedLanguageTag, "en")
+    }
+
+    func testChoosingNothingAfterAChoiceGoesBackToWhatAVFoundationPicksByItself() async throws {
+        let directory = try TestMedia.makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let (item, group) = try await itemWithTwoAudioTracks(directory)
+        let byItself = selected(item, group)
+        // The other option than the one it picks (what is picked depends on the language of the machine the test runs on).
+        let other = try XCTUnwrap(group.options.firstIndex { $0 != byItself })
+        await AVPlayerEngine.defaultApplier(item, TrackSelection(audio: other))
+        XCTAssertNotEqual(selected(item, group), byItself, "the viewer's choice is in force")
+        // An explicit choice stays in force until the automatic choice is asked for again (AVPlayer.h): without that call, the state machine says "default"
+        // and the player plays the German.
+        await AVPlayerEngine.defaultApplier(item, TrackSelection(audio: nil))
+        XCTAssertEqual(selected(item, group), byItself)
+    }
+
+    func testANumberTheStreamHasNoOptionForChangesNothing() async throws {
+        let directory = try TestMedia.makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let (item, group) = try await itemWithTwoAudioTracks(directory)
+        await AVPlayerEngine.defaultApplier(item, TrackSelection(audio: 1))
+        let chosen = selected(item, group)
+        await AVPlayerEngine.defaultApplier(item, TrackSelection(audio: 7))
+        XCTAssertEqual(selected(item, group), chosen, "what the viewer had stays")
+    }
+
+    func testTheEngineAppliesTheTracksOfALoadAndOfALaterChangeToTheRealGroup() async throws {
+        let h = try harness()
+        h.files["film"] = try await TestMedia.silentMovieWithTwoAudioTracks(seconds: 20, in: h.directory, name: "film-two")
+        h.engine.perform(.load(Epoch(1), film, startAt: 0, selection: TrackSelection(audio: 1), quality: nil))
+        await h.waitFor(.engineReady(Epoch(1)))
+        let item = try XCTUnwrap(h.player.currentItem)
+        let loaded = try await item.asset.loadMediaSelectionGroup(for: .audible)
+        let group = try XCTUnwrap(loaded)
+        XCTAssertEqual(selected(item, group)?.extendedLanguageTag, "de", "the track of the load is in force when the session is ready")
+        h.engine.perform(.applySelection(Epoch(1), TrackSelection(audio: 0)))
+        let changed = await h.wait { self.selected(item, group)?.extendedLanguageTag == "en" }
+        XCTAssertTrue(changed)
+    }
+
     // MARK: - Tracks
 
     func testTrackChangesAreAppliedInTheOrderTheyWereAskedFor() async throws {
