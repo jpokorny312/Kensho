@@ -20,6 +20,7 @@ var targets: [Target] = [
 // core's tests are run during development) the adapter is simply absent.
 #if !os(Linux)
 products.append(.library(name: "KenshoPrismCore", targets: ["KenshoPrismCore"]))
+products.append(.library(name: "KenshoAVFoundation", targets: ["KenshoAVFoundation"]))
 dependencies += [
     // Must match the requirement the app itself uses for PrismCore, or
     // SwiftPM reports two different requirements for one package.
@@ -37,6 +38,9 @@ targets.append(
         ],
         swiftSettings: [.swiftLanguageMode(.v5)]
     )
+)
+targets.append(
+    .target(name: "KenshoAVFoundation", dependencies: ["Kensho"], swiftSettings: [.swiftLanguageMode(.v5)])
 )
 #endif
 
