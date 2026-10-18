@@ -12,10 +12,11 @@ import Kensho
 /// replacement's item to `readyToPlay` on a second, silent player while
 /// `player` plays on, and only `commitSwap` puts it on `player`.
 ///
-/// What the engine reports as a stall is playback that ran dry after it had
-/// started, not the wait for the first data after `play()`, a seek or a swap:
-/// AVPlayer shows `waitingToPlayAtSpecifiedRate` for every one of those, and
-/// a quality policy that took each for a weak link would step down for nothing.
+/// What the engine reports as a stall is playback that was running and ran
+/// dry (see `StallWatch`), not the wait for the first data after `play()`, a
+/// seek or a swap: AVPlayer shows `waitingToPlayAtSpecifiedRate` for every one
+/// of those, and a quality policy that took each for a weak link would step
+/// down for nothing.
 @MainActor
 public final class AVPlayerEngine: PlaybackEngine {
     public var onEvent: ((PlaybackEvent) -> Void)?
@@ -67,9 +68,6 @@ public final class AVPlayerEngine: PlaybackEngine {
         var startAt: TimeInterval = 0
         var selection = TrackSelection()
         var seek: SeekRequest?
-        /// Whether the player has been playing since the session was last
-        /// started, resumed or moved. Waiting before that is the start.
-        var hasPlayedSinceStart = false
         var hasFailed = false
         var statusObservation: NSKeyValueObservation?
         var failureObserver: NSObjectProtocol?
@@ -111,6 +109,7 @@ public final class AVPlayerEngine: PlaybackEngine {
         return staging
     }()
     private var rateObservation: NSKeyValueObservation?
+    private var stallWatch = StallWatch()
     private var timeObserver: Any?
 
     /// - Parameter log: where a failed session is written in full (domain, code and
@@ -184,13 +183,11 @@ public final class AVPlayerEngine: PlaybackEngine {
             endReplacement()
 
         case let .play(epoch):
-            guard let session = live, session.epoch == epoch else { return }
-            session.hasPlayedSinceStart = false
+            guard live?.epoch == epoch else { return }
             player.play()
 
         case let .pause(epoch):
-            guard let session = live, session.epoch == epoch else { return }
-            session.hasPlayedSinceStart = false
+            guard live?.epoch == epoch else { return }
             player.pause()
 
         case let .seek(epoch, token, target):
@@ -201,8 +198,6 @@ public final class AVPlayerEngine: PlaybackEngine {
                 onEvent?(.engineFailed(epoch, reason: "asked to seek before the session was at its position"))
                 return
             }
-            // Waiting after a jump is the jump, not starvation.
-            session.hasPlayedSinceStart = false
             session.seek = Session.SeekRequest(token: token, target: target, attempts: 0)
             runSeek(of: session)
 
@@ -398,17 +393,15 @@ public final class AVPlayerEngine: PlaybackEngine {
         rateObservation = player.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
             let status = player.timeControlStatus
             Task { @MainActor in
-                guard let self, let session = self.live, session.stage == .running else { return }
-                switch status {
-                case .playing:
-                    session.hasPlayedSinceStart = true
-                    self.onEvent?(.engineRecovered(session.epoch))
-                case .waitingToPlayAtSpecifiedRate:
-                    // Every start waits for its first data; only a player that had been playing and
-                    // ran dry is starved. The reducer ignores both reports outside the phases they apply to.
-                    if session.hasPlayedSinceStart { self.onEvent?(.engineStalled(session.epoch)) }
-                default:
-                    break
+                guard let self else { return }
+                // Every change is seen, also those of a session that is not running yet: what the
+                // status was before is what tells a stall from a start. The reducer ignores both
+                // reports outside the phases they apply to.
+                let report = self.stallWatch.observe(status, seekInFlight: self.live?.seek != nil)
+                guard let session = self.live, session.stage == .running, let report else { return }
+                switch report {
+                case .stalled: self.onEvent?(.engineStalled(session.epoch))
+                case .recovered: self.onEvent?(.engineRecovered(session.epoch))
                 }
             }
         }
