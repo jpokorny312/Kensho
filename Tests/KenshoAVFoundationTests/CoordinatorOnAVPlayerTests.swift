@@ -8,63 +8,6 @@ import AVFoundation
 /// decides must be what the player does, and what the player does must come back
 /// as the state.
 @MainActor
-private final class Rig {
-    let directory: URL
-    let player = AVPlayer()
-    private(set) var engine: AVPlayerEngine!
-    private(set) var coordinator: PlaybackCoordinator!
-    private(set) var phases: [Phase] = []
-    private(set) var effects: [PlaybackEffect] = []
-    private(set) var applied: [TrackSelection] = []
-    /// The clock of the quality cooldown.
-    var now: TimeInterval = 1_000
-    var files: [String: URL] = [:]
-
-    init(options: AVPlayerEngine.Options = AVPlayerEngine.Options()) throws {
-        directory = try TestMedia.makeDirectory()
-        files["film"] = try TestMedia.silentAudio(seconds: 40, in: directory, name: "film")
-        files["film-lo"] = try TestMedia.silentAudio(seconds: 40, in: directory, name: "film-lo")
-        player.isMuted = true
-        engine = AVPlayerEngine(
-            player: player,
-            provider: { [weak self] request in
-                let source = request.source, quality = request.quality
-                guard let self, let url = self.files[quality.map { "\(source.id)-\($0.id)" } ?? source.id] ?? self.files[source.id] else {
-                    throw CocoaError(.fileNoSuchFile)
-                }
-                return AVPlayerItem(url: url)
-            },
-            applier: { [weak self] _, selection in self?.applied.append(selection) },
-            options: options
-        )
-        coordinator = PlaybackCoordinator(engine: engine, clock: { [weak self] in self?.now ?? 0 })
-        // The phases the film went through: a state change that only moved the position is not one.
-        coordinator.onStateChange = { [weak self] in if let self, self.phases.last != $0.phase { self.phases.append($0.phase) } }
-        coordinator.onTransition = { [weak self] _, _, effects in self?.effects.append(contentsOf: effects) }
-    }
-
-    deinit { try? FileManager.default.removeItem(at: directory) }
-
-    var state: PlaybackState { coordinator.state }
-    var playingFile: String? { (player.currentItem?.asset as? AVURLAsset)?.url.lastPathComponent }
-
-    @discardableResult
-    func wait(timeout: TimeInterval = 10, until condition: () -> Bool) async -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
-        while !condition() {
-            if Date() > deadline { return false }
-            try? await Task.sleep(nanoseconds: 20_000_000)
-        }
-        return true
-    }
-
-    /// Where the viewer sees the playback: the state's position, fed by the engine's ticks.
-    func waitUntilPlayingPast(_ position: TimeInterval) async -> Bool {
-        await wait { self.state.phase == .playing && self.state.position > position }
-    }
-}
-
-@MainActor
 final class CoordinatorOnAVPlayerTests: XCTestCase {
     private let film = MediaSource(id: "film", range: .sdr)
     private let hi = QualityChoice(id: "hi", range: .sdr)
