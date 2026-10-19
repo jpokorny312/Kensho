@@ -143,6 +143,23 @@ final class HLSFixtureTests: XCTestCase {
         XCTAssertEqual(around.after ?? -1, 16, accuracy: 0.01)
     }
 
+    func testThePictureIsEncodedOncePerKindOfStreamAndNotOncePerTest() async throws {
+        // The encoder is what a test with a picture pays for. (A length no other test uses, so that this one makes the first of its kind.)
+        let before = HLSStreamWriter.pictureEncodings
+        let first = try await HLSFixture.start(seconds: 7, picture: HLSFixture.Picture())
+        let second = try await HLSFixture.start(seconds: 7, picture: HLSFixture.Picture())
+        XCTAssertEqual(HLSStreamWriter.pictureEncodings - before, 1, "the same picture twice is encoded once")
+        XCTAssertEqual(first.keyframes, second.keyframes)
+        XCTAssertEqual(first.videoSegmentDurations, second.videoSegmentDurations)
+        let (a, _) = try await get(first.server.url(first.videoSegmentPath(1)))
+        let (b, _) = try await get(second.server.url(second.videoSegmentPath(1)))
+        XCTAssertEqual(a, b, "and the bytes are the same")
+        _ = try await HLSFixture.start(seconds: 7, segmentSeconds: 3, picture: HLSFixture.Picture())
+        XCTAssertEqual(HLSStreamWriter.pictureEncodings - before, 2, "another kind of picture is another encoding")
+        _ = try await HLSFixture.start(seconds: 7)
+        XCTAssertEqual(HLSStreamWriter.pictureEncodings - before, 2, "and a stream without a picture is none")
+    }
+
     func testLongerSegmentsOfThePictureHoldSeveralKeyframesAndStillBeginWithOne() async throws {
         // What tells a jump to the start of a segment from a jump to a keyframe: the segment has keyframes that are not its start.
         let hls = try await HLSFixture.start(seconds: 30, segmentSeconds: 6, picture: HLSFixture.Picture())

@@ -335,6 +335,9 @@ enum HLSStreamWriter {
 
     private static let pictureLock = NSLock()
     nonisolated(unsafe) private static var pictures: [String: Task<Stream, Error>] = [:]
+    nonisolated(unsafe) private static var encoded = 0
+    /// How often the encoder has run in this process (a test of the cache counts it).
+    static var pictureEncodings: Int { pictureLock.withLock { encoded } }
 
     /// The picture stream, made once for each kind: the encoder is what a test with a picture pays for, and a stream is only bytes.
     static func cachedPicture(_ picture: HLSFixture.Picture, seconds: TimeInterval, segmentSeconds: TimeInterval) async throws -> Stream {
@@ -356,6 +359,7 @@ enum HLSStreamWriter {
     /// H.264 frames of the picture, cut into segments at keyframes. The keyframes are read back out of the segments: what the encoder was asked for is a
     /// maximum, and a test about where a jump lands must know where the keyframes are.
     static func picture(_ picture: HLSFixture.Picture, seconds: TimeInterval, segmentSeconds: TimeInterval) async throws -> Stream {
+        pictureLock.withLock { encoded += 1 }
         let collector = Collector()
         let writer = AVAssetWriter(contentType: .mpeg4Movie)
         writer.outputFileTypeProfile = .mpeg4AppleHLS

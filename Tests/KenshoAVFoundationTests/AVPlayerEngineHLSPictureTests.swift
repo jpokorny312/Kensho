@@ -48,6 +48,11 @@ final class AVPlayerEngineHLSPictureTests: XCTestCase {
         return await h.waitFor(.engineReady(Epoch(1)))
     }
 
+    /// A line of the numbers behind `Docs/Zusammenfuehrung.md`, printed when `KENSHO_MEASURE` is set: `KENSHO_MEASURE=1 swift test --filter AVPlayerEngineHLSPictureTests`.
+    private func measured(_ line: @autoclosure () -> String) {
+        if ProcessInfo.processInfo.environment["KENSHO_MEASURE"] != nil { print("MEASURED: \(line())") }
+    }
+
     private func isFailure(_ event: PlaybackEvent) -> Bool { if case .engineFailed = event { return true } else { return false } }
 
     private func withoutTicks(_ events: [PlaybackEvent]) -> [PlaybackEvent] { events.filter { if case .engineTick = $0 { return false } else { return true } } }
@@ -135,10 +140,12 @@ final class AVPlayerEngineHLSPictureTests: XCTestCase {
         XCTAssertTrue(done, "\(jump): \(h.events)")
         let shown = await frame(h, probe)
         let keyframes = hls.keyframes(around: target)
-        return Landing(
+        let result = Landing(
             time: player.currentTime().seconds, frame: shown, videoSegmentStart: hls.videoSegmentStart(videoSegment),
             audioSegmentStart: hls.segmentStart(audioSegment), keyframeBefore: keyframes.before, keyframeAfter: keyframes.after
         )
+        measured("jump \(jump) to \(target) in segments of \(segmentSeconds) s, part \(loaded ? "loaded" : "not loaded"): \(result)")
+        return result
     }
 
     func testAJumpIntoAPartThatIsNotLoadedLandsOnTheTargetWhenExactAndAtTheStartOfItsSegmentWhenCheapNeverAtAKeyframeInsideIt() async throws {
@@ -215,6 +222,11 @@ final class AVPlayerEngineHLSPictureTests: XCTestCase {
         let (h, _, probes) = try await rig()
         let ready = await load(h, startAt: 13)      // the keyframe is at 12.0
         XCTAssertTrue(ready, "events: \(h.events)")
+        measured("start at 13 s: when the engine said ready the probe had seen \(probes.latest?.seen ?? [])")
+        XCTAssertTrue(
+            probes.latest?.seen.contains { abs($0 - picture.frame(at: 13)) <= 1 } == true,
+            "the picture of the start position was on the player when the engine said ready - no black screen after 'ready': \(probes.latest?.seen ?? [])"
+        )
         XCTAssertEqual(h.player.currentTime().seconds, 13, accuracy: 0.05)
         XCTAssertEqual(h.player.rate, 0)
         let probe = try XCTUnwrap(probes.latest)
@@ -296,6 +308,7 @@ final class AVPlayerEngineHLSPictureTests: XCTestCase {
         XCTAssertEqual(h.player.timeControlStatus, .waitingToPlayAtSpecifiedRate)
         probe.poll()
         let standing = probe.latest
+        measured("picture held back at 4.0 s: engineStalled with the clock at \(dryAt), the picture standing at frame \(standing.map(String.init) ?? "none")")
         XCTAssertEqual(Double(standing ?? -1), Double(picture.frame(at: 4.0)), accuracy: 3, "and the last picture is the last frame there is")
 
         try await Task.sleep(nanoseconds: 1_200_000_000)
@@ -332,6 +345,30 @@ final class AVPlayerEngineHLSPictureTests: XCTestCase {
         let recovered = await h.wait { h.events.last == .engineRecovered(Epoch(1)) || (h.lastTick(of: Epoch(1)) ?? 0) > hls.segmentStart(2) + 0.6 }
         XCTAssertTrue(recovered, "events: \(h.events.suffix(8))")
         XCTAssertEqual(h.stalls(of: Epoch(1)), 1)
+    }
+
+    func testAJumpOutOfAStallLandsElsewhereAndPlaysOnWithoutAnotherStall() async throws {
+        let (h, hls, probes) = try await rig()
+        hls.holdVideoSegment(2)      // 4.0 .. 6.0 s of the picture
+        let ready = await load(h)
+        XCTAssertTrue(ready)
+        let probe = try XCTUnwrap(probes.latest)
+        h.engine.perform(.play(Epoch(1)))
+        let stalled = await h.waitFor(.engineStalled(Epoch(1)), timeout: 15)
+        XCTAssertTrue(stalled, "events: \(withoutTicks(h.events))")
+
+        // The viewer gives up waiting and jumps to a part that is there: the stall is over, and one jump out of it is all there is to say.
+        h.engine.perform(.seek(Epoch(1), SeekToken(1), to: 20))
+        let landed = await h.waitFor(.seekFinished(Epoch(1), SeekToken(1)))
+        XCTAssertTrue(landed, "events: \(withoutTicks(h.events))")
+        let playsOn = await h.wait { (h.lastTick(of: Epoch(1)) ?? 0) > 20.6 }
+        XCTAssertTrue(playsOn, "events: \(withoutTicks(h.events).suffix(8))")
+        XCTAssertEqual(h.player.timeControlStatus, .playing)
+        XCTAssertEqual(h.stalls(of: Epoch(1)), 1, "the one stall of the held part, no second one for the jump: \(withoutTicks(h.events))")
+        XCTAssertTrue(h.events.contains(.engineRecovered(Epoch(1))), "and the player is said to be playing again")
+        probe.poll()
+        XCTAssertEqual(Double(probe.latest ?? -1), Double(picture.frame(at: h.player.currentTime().seconds)), accuracy: 3)
+        hls.releaseVideoSegment(2)
     }
 
     // MARK: - A change of the audio
@@ -401,6 +438,37 @@ final class AVPlayerEngineHLSPictureTests: XCTestCase {
         XCTAssertEqual(h.stalls(of: Epoch(2)), 0)
         XCTAssertFalse(h.events.contains { isFailure($0) })
         XCTAssertEqual(probes.all.count, 2, "the provider made two items")
+    }
+
+    // MARK: - A picture that is not there
+
+    func testAReplacementWhosePictureIsNotThereIsAFailedSwapAndNeverATakeoverWithoutAPicture() async throws {
+        // The audio of the other stream is there, its picture is not: AVPlayer does not fall back to the sound (measured: the item fails at once, 0.1 s,
+        // `NSURLErrorDomain -1100`, with a picture output or without) - so the viewer is never left with a film that has lost its picture.
+        let (h, hls, _) = try await rig()
+        let ready = await load(h)
+        XCTAssertTrue(ready)
+        h.engine.perform(.play(Epoch(1)))
+        hls.server.fail(hls.videoPlaylistPath("lo"), status: 404)
+        h.engine.perform(.prepareSwap(Epoch(2), lo, startAt: 0, selection: none))
+        let failed = await h.wait(timeout: 15) { h.events.contains { if case .swapFailed(Epoch(2), _) = $0 { return true } else { return false } } }
+        XCTAssertTrue(failed, "events: \(withoutTicks(h.events))")
+        XCTAssertFalse(h.events.contains(.swapPrepared(Epoch(2))), "the audio alone did not make it a prepared item")
+        XCTAssertFalse(h.events.contains { isFailure($0) }, "the running session did not fail")
+        XCTAssertEqual(path(of: h.player.currentItem), hls.masterPath("hi"))
+        XCTAssertGreaterThan(h.player.rate, 0)
+        if case let .swapFailed(_, reason)? = h.events.last(where: { if case .swapFailed = $0 { return true } else { return false } }) {
+            XCTAssertTrue(reason.contains("-1100"), "the reason keeps the code: \(reason)")
+        }
+    }
+
+    func testAStreamWhosePictureIsNotThereFailsTheLoadAtOnce() async throws {
+        let (h, hls, _) = try await rig()
+        hls.server.fail(hls.videoPlaylistPath("hi"), status: 404)
+        h.engine.perform(.load(Epoch(1), film, startAt: 0, selection: none, quality: nil))
+        let failed = await h.wait(timeout: 15) { h.events.contains { isFailure($0) } }
+        XCTAssertTrue(failed, "events: \(h.events)")
+        XCTAssertFalse(h.events.contains(.engineReady(Epoch(1))), "and it was never ready: the sound of it is not a film")
     }
 
     // MARK: - An engine that plays at once (the car's) on a stream with a picture
