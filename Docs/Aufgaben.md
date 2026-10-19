@@ -36,13 +36,23 @@ Stand 2026-10-19. Jede Aufgabe steht für sich und lässt sich ohne die anderen 
 
 **Danach, in Ensō:** `AdaptiveStreamGovernor` auf den Strom stützen, wo der Zugriffslog nur rät; zuerst **nur im Protokoll vergleichen** (Zugriffslog gegen Strom), dann erst ersetzen — dieselbe Vorgehensweise wie beim Schatten (`PlaybackShadow`).
 
-## C. Kensho: eine lokale HLS-Quelle für die Tests der Engine
+## C. Kensho: eine lokale HLS-Quelle für die Tests der Engine — **gebaut (2026-10-19), nur Ton; Video und Rest offen**
 
-**Warum.** `AVPlayerEngine` ist bisher nur an stummen Audiodateien geprüft. Nicht geprüft sind: ein **Stau mitten im Film** (eine Progressive-Quelle, die ein Test drosselt, läuft in AVPlayer im Standardmodus gar nicht erst an; mit `automaticallyWaitsToMinimizeStalling = false` hält er an, statt zu warten), die **Mediengruppen eines echten Mehrspur-Stroms** (der Standard-Applier ist nur an einer QuickTime-Datei mit zwei Tonspuren geprüft; die Untertitel-Seite — `legible`, `allowsEmptySelection` — überhaupt nicht), **Sprünge in einem HLS-Strom** (eine lokale Datei klemmt ein Ziel hinter dem Ende selbst; ob HLS dasselbe tut, ist offen — `SeekTarget` setzt es voraus), und **`copy()` auf iOS/tvOS** (gemessen ist nur macOS).
+**Warum.** `AVPlayerEngine` war nur an stummen Audiodateien geprüft: ein **Stau mitten im Film** (eine gedrosselte Progressive-Quelle lief in AVPlayer im Standardmodus gar nicht erst an), die **Mediengruppen eines Mehrspur-Stroms**, **Sprünge in einem HLS-Strom** und `copy()` eines HLS-Items waren offen.
 
-**Was fehlt.** Ein kleiner HTTP-Server im Test (Loopback, Port 0), der ein HLS-Master mit zwei Tonspuren und einer Untertitelspur ausliefert — Segmente aus erzeugten Medien (`AVAssetWriter`; der Test erzeugt schon QuickTime-Dateien mit zwei Spuren in `TestMedia`), und der **ein Segment ausbleiben lässt**, wenn der Test es sagt (Stau). Für die Segmente: `AVAssetWriter` mit `outputFileTypeProfile = .mpeg4AppleHLS` (nicht erprobt) oder von Hand geschnittene Stücke fester Dauer. Prüfungen, die damit möglich werden: `StallWatch` gegen einen echten Stau, `engineStalled` und die Erholung; Tonspur- und Untertitelwechsel am echten Strom (ob der Standard-Applier die Wirkung hat, die der Test verlangt); `seek` hinter das Ende und in nicht geladene Teile; das Ende des Stroms (das Modell hat dafür bis heute kein Ereignis).
+**Was gebaut ist** (alles unter `Tests/KenshoAVFoundationTests`, zur Laufzeit erzeugt, keine Binärdateien):
 
-Messen über HTTP (nicht über einen gemounteten Pfad) ist hier kein Zusatz, sondern der Zweck.
+- `LoopbackHTTPServer.swift`: ein kleiner HTTP/1.1-Server auf 127.0.0.1 (Network.framework, Port vom System, eine Anfrage je Verbindung, `Cache-Control: no-store`, Range). Ein Test kann einen Pfad **zurückhalten** (`hold`, die Anfrage wird gelesen und bleibt offen, bis `release`), einen Pfad mit einem **Fehlerstatus** beantworten (`fail`) und jede Anfrage im Protokoll lesen (`requestedPaths`). Gemessen wird so über HTTP, wie es die Apps tun.
+- `HLSFixture.swift`: ein Strom nur aus Ton, den `AVAssetWriter` im Profil `.mpeg4AppleHLS` als fMP4-AAC-Segmente schreibt (rund 2 s je Segment, 30 s in 0,16 s erzeugt), mit einem Master, der zwei Tonspuren (`en`, `de`) und zwei WebVTT-Untertitel (`en`, `de`) nennt, und zwei Varianten (`hi`, `lo`: dieselben Bytes unter eigenen Pfaden — der Wechsel der Qualität ist ein anderer Master, wie in der App). `holdSegment(n)` hält das Segment in allen Tonspuren zurück.
+- Tests: `HLSFixtureTests` (6: Server und Strom sind, was die anderen Tests annehmen), `AVPlayerEngineHLSTests` (26), `CoordinatorOnHLSTests` (6). Ergebnisse: `Docs/Zusammenfuehrung.md`, „Die Engine gegen einen HLS-Strom“.
+
+**Was fehlt** (jeweils, was man dafür bräuchte):
+
+- **Bild.** Der Strom hat keins, also keine Schlüsselbilder: ob `Options.jumps = .cheapest` an Video dort landet, wo die alte Engine des Autos landete (am Schlüsselbild), zeigt nur ein Strom mit H.264/HEVC (`AVAssetWriter` mit einem Videoeingang aus erzeugten Pixelpuffern, im selben Profil; die Kosten sind der Encoder je Test). An Ton allein ist gemessen: ausdrückliche unendliche Toleranz und das einfache `seek(to:)` landen gleich — am Anfang des Segments, wenn es nicht geladen ist.
+- **Ein Strom, der wächst** (Live/Event: Playlist ohne `#EXT-X-ENDLIST`, wanderndes Fenster): dort klemmt AVPlayer ein Sprungziel außerhalb des Suchbaren vielleicht nicht selbst (im VOD-Strom tut er es: Sprung auf 5 000 s landet am Ende, auf −5 s am Anfang), `SeekTarget` ist dafür geschrieben und dort nicht erprobt.
+- **PrismCore als Quelle**, Bild-Untertitel, Dolby Vision, HDR, mehrere Auflösungen in einem Master (die Leiter einer Variante gegen die andere im selben Item): nicht Teil dieser Quelle.
+- **iOS und tvOS.** `copy()` eines HLS-Items und die Zeiten von AVPlayer sind nur auf macOS gemessen; die Tests wurden für die Geräte-SDKs nicht gebaut (`swift test` läuft auf macOS) und sind dort nie gelaufen.
+- **Ein Item, das nach `readyToPlay` auf `failed` geht**: nicht erzeugt (ein sterbendes HLS-Item meldet sich mit `AVPlayerItemFailedToPlayToEndTime`, `status` bleibt `readyToPlay`; unten gemessen).
 
 ## D. Schritte 2 bis 4 der Liste: ein Schritt, nicht drei
 
