@@ -1,6 +1,6 @@
 # Kensho in Ensō
 
-Ersetzt `Adapter-Einbau.md` des Entwurfs („nur auf Syntax geprüft“): so hängt das Paket jetzt wirklich in der App. (Reducer, Coordinator und `AVPlayerEngine` hängen noch **nicht** in der App; die App nutzt Log, Launcher, `PlaylistDiagnostics` und das Routing.)
+Ersetzt `Adapter-Einbau.md` des Entwurfs („nur auf Syntax geprüft“): so hängt das Paket jetzt wirklich in der App. Die App nutzt Log, Launcher, `PlaylistDiagnostics` und das Routing, und der Zustandsautomat läuft **im Schatten** beider `PlayerView`s (`PlaybackShadow`: er sieht, was die App tut, und schreibt auf, wo er anders entschieden hätte; er steuert nichts). Der `PlaybackCoordinator` als Steuerung und `AVPlayerEngine` hängen noch **nicht** in der App.
 
 ## Das Paket im Projekt
 
@@ -21,13 +21,21 @@ Ersetzt `Adapter-Einbau.md` des Entwurfs („nur auf Syntax geprüft“): so hä
 | `PrismCorePlayback.runDiagnostics`, `consumeStartupCheckpoints` (iPhone; die Fallback-Stufen des Players rufen sie) | Weiterleitungen auf `PlaylistDiagnostics.run` und `PrismCoreLauncher.consumeStartupCheckpoints`; `PlayerView` blieb unverändert. |
 | `struct PrismCoreSilentStream` in beiden Apps | `PrismCoreSilentStream` in `KenshoPrismCore`. |
 
+## Der Schatten in den Ansichten
+
+`JellyfinPhone/PlayerView.swift` und `JellyfinTV/PlayerView.swift` halten ein `@State private var shadow = PlaybackShadow(log: PrismDiagnosticLog.kensho)` und sagen ihm an den Stellen, an denen der alte Code ohnehin etwas tut, was er tut (Tabelle: `Docs/Zusammenfuehrung.md`, „Der Schatten in Ensō“). Im Protokoll der App (`prismcore-diagnostics.log`) tragen seine Zeilen die Marke `kensho`; eine Abweichung, die länger anhält als eine Schwelle, hat `DEVIATION` in der Zeile. Die UI-Tests des Harness schreiben die Zeilen eines Tests in seine Notizen (`<Test>-kensho.txt`), und einzelne Tests prüfen „keine Abweichung“ (`testKenshoFollowsTheJumpButtons`, `testAViewerWhoPausedIsStillPausedAfterTheTripThroughTheBackground`) oder halten eine bekannte fest (`testAViewerWhoPausesWhileTheStreamIsSwappedIsStillPausedAfterwards`, mit `XCTExpectFailure`).
+
+## Kensho und Ensō gleich halten
+
+`Scripts/kensho-sync.sh status|to-enso|from-enso` (Umgebung `KENSHO_SRC`, standardmäßig `~/Dev/Kensho`; ein Worktree davon geht auch) gleicht `Package.swift`, `Sources/`, `Tests/`, `Docs/` und `README.md` zwischen `Kensho/` hier und dem Kensho-Repository ab, nach dem Inhalt, in beide Richtungen; `CLAUDE.md` und `.gitignore` gehören dem Kensho-Repository, `.build`, `.swiftpm` und `Package.resolved` werden nicht kopiert. Solange nicht entschieden ist, ob Ensō das Kensho-Repository per Revision einbindet (`CLAUDE.md` dort, „Wie Kensho nach Enso kommt“), ist das der Weg.
+
 Die Diagnose der Playlist (`PlaylistDiagnostics`): iPhone `.full` und mit Warten (bis zum ersten Segment, wie bisher); Apple TV `.light` ohne Warten (die Playlist und das Urteil von AVFoundation, wie bisher die zwei
 `print`-Proben). Wer die Apple TV auf `.full` heben will, ändert zwei Zeilen (`diagnostics`, `awaitDiagnostics`) in `JellyfinTV/PrismCorePlayback.swift`.
 
 ## Prüfen
 
-- `cd Kensho && swift test` — 124 Tests, ohne Gerät: Sitzungen und Rotation des Protokolls, Fehlerketten, Routing, der Reducer samt Wechsel der Qualität, der Coordinator, die Diagnose der Playlist (gegen eine gespielte Antwort), `AVPlayerEngine` gegen einen echten `AVPlayer` (erzeugte stumme Dateien).
-- `swift test` im Hauptordner (das Kit) und die UI-Tests des Harness: `Scripts/UITestHarness/run-ios-tests.sh`, `run-tvos-tests.sh`. Die Wege durch den Launcher decken ab: `testAFilmWithEAC3AudioKeepsItsSoundThroughPrismCore`
+- `cd Kensho && swift test` — 196 Tests (Kern 110, `KenshoAVFoundation` 86), ohne Gerät: Sitzungen und Rotation des Protokolls, Fehlerketten, Routing, der Reducer samt Wechsel der Qualität, der Coordinator, der Schatten, die Diagnose der Playlist (gegen eine gespielte Antwort), `AVPlayerEngine` gegen einen echten `AVPlayer` (erzeugte stumme Dateien).
+- `swift test` im Hauptordner (das Kit; 1013 Tests, 13 übersprungen) und die UI-Tests des Harness: `Scripts/UITestHarness/run-ios-tests.sh`, `run-tvos-tests.sh`. Die Wege durch den Launcher decken ab: `testAFilmWithEAC3AudioKeepsItsSoundThroughPrismCore`
   (HEVC + E-AC-3 über PrismCore, die Zeile `audio: #1 bridged … master.m3u8`), `testAnHTTPSStreamIsReadThroughTheSystemAndPlays` (der Leser und sein Protokoll), `testAutoAdvanceEndsInThePreparedEpisode` (Vorbereitung der nächsten Folge),
   die CarPlay-Tests; auf der Apple TV `testNextEpisodeIsPreparedBeforeItIsDue` (Vorbereitung ohne Umschalten des Bildschirms). Die HDMI-Umschaltung (`TVDisplayCoordination`) gibt es im Simulator nicht: sie ist gebaut, aber nur auf der
   echten Apple TV zu prüfen.
