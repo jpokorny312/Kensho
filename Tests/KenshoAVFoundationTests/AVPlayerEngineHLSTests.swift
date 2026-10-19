@@ -172,6 +172,91 @@ final class AVPlayerEngineHLSTests: XCTestCase {
         XCTAssertTrue(recovered)
     }
 
+    func testChangingTheAudioWhileItPlaysIsNoStall() async throws {
+        let (h, hls) = try await rig()
+        let ready = await load(h)
+        XCTAssertTrue(ready)
+        h.engine.perform(.play(Epoch(1)))
+        await h.wait { (h.lastTick(of: Epoch(1)) ?? 0) > 0.8 }
+        let item = try XCTUnwrap(h.player.currentItem)
+        let (audible, _) = try await groups(of: item)
+        // The premise, seen on the player itself: another audio rendition is not an edit of the one that plays - AVPlayer drops what it had and waits for the
+        // other (measured: `playing` -> `waitingToPlayAtSpecifiedRate` for some tens of milliseconds, the reason the very one of a real stall).
+        let waited = Flag()
+        let observation = h.player.observe(\.timeControlStatus, options: [.new]) { player, _ in
+            if player.timeControlStatus == .waitingToPlayAtSpecifiedRate { waited.isSet = true }
+        }
+        h.clearEvents()
+
+        h.engine.perform(.applySelection(Epoch(1), TrackSelection(audio: 1)))
+        let switched = await h.wait { self.tag(item, audible) == "de" }
+        XCTAssertTrue(switched)
+        try await Task.sleep(nanoseconds: 1_200_000_000)
+        XCTAssertTrue(waited.isSet, "the player waited for the other rendition (else this test shows nothing)")
+        XCTAssertEqual(h.stalls(of: Epoch(1)), 0, "a choice of the viewer is no weak link: \(h.events.filter { if case .engineTick = $0 { return false } else { return true } })")
+        XCTAssertTrue(hls.server.requestedPaths.contains { $0.hasPrefix("/hi/audio-de/seg") }, "and it is the German that is loaded now")
+
+        // The way back, to what AVFoundation chooses itself, is a change as well.
+        waited.isSet = false
+        h.engine.perform(.applySelection(Epoch(1), TrackSelection(audio: nil)))
+        let back = await h.wait { self.tag(item, audible) == "en" }
+        XCTAssertTrue(back)
+        try await Task.sleep(nanoseconds: 1_200_000_000)
+        XCTAssertTrue(waited.isSet)
+        XCTAssertEqual(h.stalls(of: Epoch(1)), 0)
+        observation.invalidate()
+    }
+
+    func testAnAppliersSlownessDoesNotTurnItsChangeIntoAStall() async throws {
+        // An applier of the app's own may take its time before it changes the item; the wait is still the change's.
+        let (h, _) = try await rig(applier: { item, selection in
+            if selection.audio == 1 { try? await Task.sleep(nanoseconds: 1_300_000_000) }
+            await AVPlayerEngine.defaultApplier(item, selection)
+        })
+        let ready = await load(h)
+        XCTAssertTrue(ready)
+        h.engine.perform(.play(Epoch(1)))
+        await h.wait { (h.lastTick(of: Epoch(1)) ?? 0) > 0.8 }
+        let item = try XCTUnwrap(h.player.currentItem)
+        let (audible, _) = try await groups(of: item)
+        let waited = Flag()
+        let observation = h.player.observe(\.timeControlStatus, options: [.new]) { player, _ in
+            if player.timeControlStatus == .waitingToPlayAtSpecifiedRate { waited.isSet = true }
+        }
+        h.clearEvents()
+
+        h.engine.perform(.applySelection(Epoch(1), TrackSelection(audio: 1)))
+        let switched = await h.wait(timeout: 5) { self.tag(item, audible) == "de" }
+        XCTAssertTrue(switched)
+        try await Task.sleep(nanoseconds: 1_000_000_000)
+        XCTAssertTrue(waited.isSet, "the player waited for the other rendition (else this test shows nothing)")
+        XCTAssertEqual(h.stalls(of: Epoch(1)), 0, "events: \(h.events.filter { if case .engineTick = $0 { return false } else { return true } })")
+        observation.invalidate()
+    }
+
+    func testAnAudioChoiceWhoseDataDoesNotComeIsAStallAfterTheGraceAfterAll() async throws {
+        let (h, hls) = try await rig()
+        // The German of the second the player will be at is not to be had.
+        hls.server.hold(hls.segmentPath(audio: "de", hls.segmentIndex(at: 9.5)))
+        let ready = await load(h, startAt: 9)
+        XCTAssertTrue(ready)
+        h.engine.perform(.play(Epoch(1)))
+        await h.wait { (h.lastTick(of: Epoch(1)) ?? 0) > 9.3 }
+        h.clearEvents()
+
+        let choseAt = Date()
+        h.engine.perform(.applySelection(Epoch(1), TrackSelection(audio: 1)))
+        try await Task.sleep(nanoseconds: 1_800_000_000)
+        XCTAssertEqual(h.stalls(of: Epoch(1)), 0, "for the first seconds the wait is the choice")
+        XCTAssertEqual(h.player.timeControlStatus, .waitingToPlayAtSpecifiedRate, "and it goes on")
+        let stalled = await h.waitFor(.engineStalled(Epoch(1)), timeout: 6)
+        XCTAssertTrue(stalled, "a wait that lasts is one: \(h.events.filter { if case .engineTick = $0 { return false } else { return true } })")
+        XCTAssertGreaterThan(Date().timeIntervalSince(choseAt), StallWatch.resumeGrace - 0.5, "but not before the grace of a start is over")
+        hls.server.release(hls.segmentPath(audio: "de", hls.segmentIndex(at: 9.5)))
+        let recovered = await h.wait { (h.lastTick(of: Epoch(1)) ?? 0) > 10.5 }
+        XCTAssertTrue(recovered, "and the German plays when it comes")
+    }
+
     // MARK: - The default applier on the groups of a stream
 
     func testTheDefaultApplierChoosesAudioAndSubtitleOfARealStreamAtTheirNumbers() async throws {

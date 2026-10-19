@@ -277,7 +277,11 @@ public final class AVPlayerEngine: PlaybackEngine {
             session.selectionTask = Task { [weak self, weak session] in
                 await previous?.value
                 guard !Task.isCancelled, let self, let session, session === self.live else { return }
+                // Another audio rendition makes AVPlayer drop what it had and wait for the other; the wait that follows is the viewer's choice, not a stream
+                // that ran dry (and a quality policy that took it for one would step down for nothing).
+                self.stallWatch.trackChanged(now: ProcessInfo.processInfo.systemUptime)
                 await self.applier(item, selection)
+                self.stallWatch.trackChanged(now: ProcessInfo.processInfo.systemUptime)
             }
 
         case .stop:
