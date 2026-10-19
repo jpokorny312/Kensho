@@ -124,6 +124,126 @@ final class HLSFixtureTests: XCTestCase {
         XCTAssertFalse(paths.contains { $0.hasPrefix("/hi/audio-de/seg") }, "the rendition it was not asked for is not loaded: \(paths)")
     }
 
+    // MARK: - The picture
+
+    func testThePictureIsSegmentsOfTwoSecondsThatEachBeginWithTheKeyframeOfTheirGroupOfPictures() async throws {
+        let hls = try await HLSFixture.start(seconds: 30, picture: HLSFixture.Picture())
+        XCTAssertEqual(hls.videoSegmentDurations.count, 15)
+        XCTAssertTrue(hls.videoSegmentDurations.allSatisfy { abs($0 - 2) < 0.01 }, "\(hls.videoSegmentDurations)")
+        // Read back out of the segments, not assumed from what the encoder was asked for: a keyframe at least every two seconds is all it promises.
+        XCTAssertEqual(hls.keyframes.count, 15, "one keyframe in each segment and none in between: \(hls.keyframes)")
+        for (index, time) in hls.keyframes.enumerated() { XCTAssertEqual(time, Double(index) * 2, accuracy: 0.01) }
+        for index in hls.videoSegmentDurations.indices {
+            XCTAssertTrue(hls.keyframes.contains { abs($0 - hls.videoSegmentStart(index)) < 0.01 }, "segment \(index) begins with a keyframe")
+        }
+        XCTAssertEqual(hls.videoSegmentIndex(at: 15.6), 7)
+        XCTAssertEqual(hls.videoSegmentStart(7), 14, accuracy: 0.01)
+        let around = hls.keyframes(around: 15.6)
+        XCTAssertEqual(around.before ?? -1, 14, accuracy: 0.01)
+        XCTAssertEqual(around.after ?? -1, 16, accuracy: 0.01)
+    }
+
+    func testLongerSegmentsOfThePictureHoldSeveralKeyframesAndStillBeginWithOne() async throws {
+        // What tells a jump to the start of a segment from a jump to a keyframe: the segment has keyframes that are not its start.
+        let hls = try await HLSFixture.start(seconds: 30, segmentSeconds: 6, picture: HLSFixture.Picture())
+        XCTAssertEqual(hls.videoSegmentDurations.count, 5)
+        XCTAssertTrue(hls.videoSegmentDurations.allSatisfy { abs($0 - 6) < 0.01 }, "\(hls.videoSegmentDurations)")
+        XCTAssertEqual(hls.keyframes.count, 15, "still a keyframe every two seconds: \(hls.keyframes)")
+        for (index, time) in hls.keyframes.enumerated() { XCTAssertEqual(time, Double(index) * 2, accuracy: 0.01) }
+        XCTAssertEqual(hls.videoSegmentIndex(at: 15.6), 2)
+        XCTAssertEqual(hls.videoSegmentStart(2), 12, accuracy: 0.01)
+        XCTAssertEqual(hls.keyframes(around: 15.6).before ?? -1, 14, accuracy: 0.01, "a keyframe in the segment that is not its start")
+    }
+
+    func testTheMasterOfAStreamWithAPictureNamesTheVideoVariantWithTheGroupsOfTheAudioOnlyOne() async throws {
+        let hls = try await HLSFixture.start(seconds: 10, picture: HLSFixture.Picture())
+        let (master, _) = try await get(hls.masterURL())
+        let text = String(decoding: master, as: UTF8.self)
+        let variant = try XCTUnwrap(text.components(separatedBy: "\n").first { $0.hasPrefix("#EXT-X-STREAM-INF") })
+        XCTAssertTrue(variant.contains("RESOLUTION=320x180"), variant)
+        XCTAssertTrue(variant.contains("CODECS=\"avc1."), variant)
+        XCTAssertTrue(variant.contains("AUDIO=\"aud\"") && variant.contains("SUBTITLES=\"sub\""), "the same groups as the stream without a picture: \(variant)")
+        XCTAssertTrue(text.contains("\nvideo.m3u8\n"), "the variant is the playlist of the picture")
+        XCTAssertEqual(text.components(separatedBy: "TYPE=AUDIO").count - 1, 2)
+        let (playlist, _) = try await get(hls.server.url(hls.videoPlaylistPath()))
+        XCTAssertEqual(String(decoding: playlist, as: UTF8.self).components(separatedBy: "#EXTINF:").count - 1, hls.videoSegmentDurations.count)
+        // The stream without one stays what the other tests count on.
+        let audioOnly = try await HLSFixture.start(seconds: 10)
+        let (plain, _) = try await get(audioOnly.masterURL())
+        XCTAssertFalse(String(decoding: plain, as: UTF8.self).contains("video.m3u8"))
+        XCTAssertTrue(audioOnly.keyframes.isEmpty)
+        XCTAssertTrue(audioOnly.videoSegmentDurations.isEmpty)
+    }
+
+    func testAnAVPlayerShowsTheFramesOfThePictureAndItsClockAgreesWithTheNumberOfTheFrame() async throws {
+        let hls = try await HLSFixture.start(seconds: 12, picture: HLSFixture.Picture())
+        let player = AVPlayer()
+        player.isMuted = true
+        let item = AVPlayerItem(url: hls.masterURL())
+        let probe = PictureProbe(item: item)
+        player.replaceCurrentItem(with: item)
+        var ready = false
+        for _ in 0..<500 where !ready {
+            try await Task.sleep(nanoseconds: 10_000_000)
+            ready = item.status != .unknown
+        }
+        XCTAssertEqual(item.status, .readyToPlay, "\(String(describing: item.error))")
+        XCTAssertEqual(item.presentationSize, CGSize(width: 320, height: 180))
+        XCTAssertEqual(item.duration.seconds, 12, accuracy: 0.2)
+
+        player.play()
+        var checked = 0
+        for _ in 0..<150 where checked < 6 {
+            try await Task.sleep(nanoseconds: 20_000_000)
+            guard player.currentTime().seconds > 0.4 + Double(checked) * 0.5, let shown = probe.poll() else { continue }
+            let expected = HLSFixture.Picture().frame(at: item.currentTime().seconds)
+            XCTAssertEqual(Double(shown), Double(expected), accuracy: 2, "the picture is the frame of the clock, at \(item.currentTime().seconds) s")
+            checked += 1
+        }
+        XCTAssertEqual(checked, 6, "six looks over three seconds; it plays")
+        let paths = hls.server.requestedPaths
+        XCTAssertTrue(paths.contains(hls.videoInitializationPath()) && paths.contains(hls.videoSegmentPath(0)), "the picture came over HTTP, segment by segment: \(paths)")
+    }
+
+    // MARK: - Forced subtitles
+
+    func testForcedSubtitlesAreTheLastOptionsOfTheGroupAndAVFoundationChoosesTheOneOfTheAudiosLanguageOnItsOwn() async throws {
+        // The premise of the tests of the applier: this is what AVFoundation does with FORCED=YES,DEFAULT=YES,AUTOSELECT=YES, and a player that chose
+        // otherwise (a machine with other settings) would make those tests show nothing.
+        let hls = try await HLSFixture.start(seconds: 20, forcedSubtitles: ["en", "de"])
+        let player = AVPlayer()
+        player.isMuted = true
+        let item = AVPlayerItem(url: hls.masterURL())
+        player.replaceCurrentItem(with: item)
+        var ready = false
+        for _ in 0..<500 where !ready {
+            try await Task.sleep(nanoseconds: 10_000_000)
+            ready = item.status != .unknown
+        }
+        XCTAssertEqual(item.status, .readyToPlay, "\(String(describing: item.error))")
+        let loadedLegible = try await item.asset.loadMediaSelectionGroup(for: .legible)
+        let legible = try XCTUnwrap(loadedLegible)
+        XCTAssertEqual(legible.options.map(\.extendedLanguageTag), ["en", "de", "en", "de"], "the forced ones follow the others, in the order of the master")
+        XCTAssertEqual(legible.options.map { $0.hasMediaCharacteristic(.containsOnlyForcedSubtitles) }, [false, false, true, true])
+        XCTAssertTrue(legible.allowsEmptySelection)
+        let loadedAudible = try await item.asset.loadMediaSelectionGroup(for: .audible)
+        let audible = try XCTUnwrap(loadedAudible)
+        XCTAssertEqual(item.currentMediaSelection.selectedMediaOption(in: audible)?.extendedLanguageTag, "en")
+        let chosen = item.currentMediaSelection.selectedMediaOption(in: legible)
+        XCTAssertTrue(chosen?.hasMediaCharacteristic(.containsOnlyForcedSubtitles) == true, "AVFoundation shows the forced subtitles on its own: \(String(describing: chosen))")
+        XCTAssertEqual(chosen?.extendedLanguageTag, "en", "the one in the language of the audio it plays")
+
+        player.play()
+        var loaded = false
+        for _ in 0..<300 where !loaded {
+            try await Task.sleep(nanoseconds: 20_000_000)
+            loaded = hls.server.requestedPaths.contains(hls.subtitleSegmentPath(code: "forced-en"))
+        }
+        XCTAssertTrue(loaded, "and loads it: \(hls.server.requestedPaths)")
+        XCTAssertFalse(hls.server.requestedPaths.contains(hls.subtitleSegmentPath(code: "forced-de")))
+        XCTAssertFalse(hls.server.requestedPaths.contains(hls.subtitleSegmentPath(code: "en")))
+    }
+
     func testTwoVariantsAreTwoStreamsToTheServerAndTheSameToThePlayer() async throws {
         let hls = try await HLSFixture.start(seconds: 10)
         let (hi, _) = try await get(hls.masterURL("hi"))
