@@ -205,4 +205,28 @@ final class PlayerItemLogDumpTests: XCTestCase {
         PlayerItemLogDump.dump(AVPlayerItem(url: URL(fileURLWithPath: "/nonexistent.mp4")), log: KenshoLog(sinks: [sink]), tag: "initial")
         XCTAssertEqual(sink.lines, ["[initial] errorLog: empty", "[initial] accessLog: empty"])
     }
+
+    /// The address AVPlayer asked for is the address of the stream, and a Jellyfin stream carries the account's token in it: the log is shared for
+    /// diagnosis (it was not redacted before, in the log of the app either).
+    func testTheAddressOfARequestIsLoggedWithoutTheTokenInItsQuery() {
+        let line = PlayerItemLogDump.accessLine(index: 0, uri: "https://home.example:8920/Videos/abc/stream.mp4?Static=true&api_key=SECRET123&MediaSourceId=abc",
+                                                requests: 3, bytes: 1_000, duration: 0.5, observedBitrate: 2e6, indicatedBitrate: 4e6, switchBitrate: 0, playbackType: "VOD")
+        XCTAssertFalse(line.contains("SECRET123"), line)
+        XCTAssertFalse(line.contains("api_key"), line)
+        XCTAssertTrue(line.contains("uri=https://home.example:8920/Videos/abc/stream.mp4 requests=3"), "the host and the path stay: they are what the line is for: \(line)")
+        XCTAssertTrue(line.contains("bytes=1000 duration=0.5 observedBitrate=2000000.0 indicatedBitrate=4000000.0 switchBitrate=0.0 playbackType=VOD"), line)
+    }
+
+    func testTheUriAndTheCommentOfAnErrorAreLoggedWithoutAToken() {
+        let line = PlayerItemLogDump.errorLine(index: 1, date: "2026-10-19", uri: "https://home.example/Videos/abc/master.m3u8?api_key=SECRET123", server: "192.168.1.5",
+                                               statusCode: 404, domain: "CoreMediaErrorDomain",
+                                               comment: "Cannot read https://home.example/Videos/abc/seg0.m4s?X-Emby-Token=SECRET456 (access_token=SECRET789)")
+        XCTAssertFalse(line.contains("SECRET"), line)
+        XCTAssertTrue(line.contains("uri=https://home.example/Videos/abc/master.m3u8 server=192.168.1.5 statusCode=404 domain=CoreMediaErrorDomain comment=Cannot read https://home.example/Videos/abc/seg0.m4s"), line)
+    }
+
+    func testAMissingAddressIsAQuestionMarkAsBefore() {
+        let line = PlayerItemLogDump.errorLine(index: 0, date: nil, uri: nil, server: nil, statusCode: 0, domain: "d", comment: nil)
+        XCTAssertEqual(line, "  [0] date=? uri=? server=? statusCode=0 domain=d comment=?")
+    }
 }
