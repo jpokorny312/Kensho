@@ -50,22 +50,33 @@ enum PictureCode {
 /// here without a screen. (Added before the item plays, or at any time: it holds the frames from then on.)
 ///
 /// A frame is handed over once; `latest` is the last that came, and `forget()` before an action makes a test wait for a frame that the action brought.
+/// A probe that `watches` asks for one every ten milliseconds by itself, so that `seen` holds every frame from the moment the probe was made (the first
+/// pictures of an item are over before a test that polls when it likes looks); the others only when `poll()` is called.
 @MainActor
 final class PictureProbe {
     private let item: AVPlayerItem
     private let output: AVPlayerItemVideoOutput
+    private var timer: Timer?
     /// The number of the frame that came last (nil: none since the start or the last `forget()`).
     private(set) var latest: Int?
     /// Every frame number seen, in order of arrival (a frame twice in a row is there once).
     private(set) var seen: [Int] = []
 
-    init(item: AVPlayerItem) {
+    init(item: AVPlayerItem, watches: Bool = false) {
         self.item = item
         output = AVPlayerItemVideoOutput(pixelBufferAttributes: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
         item.add(output)
+        if watches {
+            timer = Timer.scheduledTimer(withTimeInterval: 0.01, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated { _ = self?.poll() }
+            }
+        }
     }
 
-    deinit { item.remove(output) }
+    deinit {
+        timer?.invalidate()
+        item.remove(output)
+    }
 
     func forget() {
         latest = nil

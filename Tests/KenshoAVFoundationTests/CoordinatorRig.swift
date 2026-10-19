@@ -19,6 +19,9 @@ final class Rig {
     var files: [String: URL] = [:]
     /// What the test needs for as long as the rig lives and holds nothing itself: a server the URLs of `files` point to.
     var retained: [AnyObject] = []
+    /// Called with every item the provider makes, before it is on the player. A test with a picture puts its `PictureProbe` on it here: a player with
+    /// nothing that takes its frames does not wait for the picture (`HLSFixtureTests`), and would play on past a part of it that is not there.
+    var itemMade: ((AVPlayerItem) -> Void)?
 
     /// - Parameters:
     ///   - makesFiles: write the two files `film` and `film-lo` (40 s of silence each); a test that sets `files` itself, to streams, says no.
@@ -38,7 +41,9 @@ final class Rig {
                 guard let self, let url = self.files[quality.map { "\(source.id)-\($0.id)" } ?? source.id] ?? self.files[source.id] else {
                     throw CocoaError(.fileNoSuchFile)
                 }
-                return AVPlayerItem(url: url)
+                let item = AVPlayerItem(url: url)
+                self.itemMade?(item)
+                return item
             },
             applier: recordsSelections ? { [weak self] _, selection in self?.applied.append(selection) } : nil,
             options: options

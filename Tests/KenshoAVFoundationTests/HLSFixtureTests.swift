@@ -205,6 +205,35 @@ final class HLSFixtureTests: XCTestCase {
         XCTAssertTrue(paths.contains(hls.videoInitializationPath()) && paths.contains(hls.videoSegmentPath(0)), "the picture came over HTTP, segment by segment: \(paths)")
     }
 
+    func testAPlayerThatNothingTakesTheFramesFromDoesNotWaitForThePictureAndOneThatHasAnOutputOrALayerDoes() async throws {
+        // Why every test with a picture puts a `PictureProbe` on its item before it plays: a player with no view, no layer and no output has no use for the
+        // picture, and plays the audio past a part of it that is not there (measured: the clock at 5.9 s after six seconds, where a player that has to
+        // show it stands at 3.9, the end of the picture it has). A test that kept a segment of the picture back and had no probe would show nothing.
+        let hls = try await HLSFixture.start(seconds: 30, picture: HLSFixture.Picture())
+        hls.holdVideoSegment(2)      // 4.0 .. 6.0 s of the picture; the audio is all there
+        func start(withOutput: Bool, withLayer: Bool) -> (AVPlayer, [AnyObject]) {
+            let player = AVPlayer()
+            player.isMuted = true
+            let item = AVPlayerItem(url: hls.masterURL())
+            var kept: [AnyObject] = []
+            if withOutput { kept.append(PictureProbe(item: item)) }
+            if withLayer { kept.append(AVPlayerLayer(player: player)) }
+            player.replaceCurrentItem(with: item)
+            player.play()
+            return (player, kept)
+        }
+        let (blind, keptBlind) = start(withOutput: false, withLayer: false)
+        let (withOutput, keptOutput) = start(withOutput: true, withLayer: false)
+        let (withLayer, keptLayer) = start(withOutput: false, withLayer: true)
+        try await Task.sleep(nanoseconds: 6_000_000_000)
+        XCTAssertGreaterThan(blind.currentTime().seconds, 5.5, "nothing takes the frames: it plays on")
+        XCTAssertEqual(withOutput.currentTime().seconds, 4.0, accuracy: 0.3, "an output: it waits for the picture")
+        XCTAssertEqual(withOutput.timeControlStatus, .waitingToPlayAtSpecifiedRate)
+        XCTAssertEqual(withLayer.currentTime().seconds, 4.0, accuracy: 0.3, "a layer, in no window: it waits for the picture")
+        XCTAssertEqual(withLayer.timeControlStatus, .waitingToPlayAtSpecifiedRate)
+        withExtendedLifetime((keptBlind, keptOutput, keptLayer)) {}
+    }
+
     // MARK: - Forced subtitles
 
     func testForcedSubtitlesAreTheLastOptionsOfTheGroupAndAVFoundationChoosesTheOneOfTheAudiosLanguageOnItsOwn() async throws {
