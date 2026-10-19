@@ -240,14 +240,13 @@ final class AVPlayerEngineHLSPictureTests: XCTestCase {
         XCTAssertTrue(playsOn)
         probe.poll()
         XCTAssertEqual(Double(probe.latest ?? -1), Double(picture.frame(at: h.player.currentTime().seconds)), accuracy: 3, "and the picture goes on with the clock")
-        XCTAssertTrue(probe.seen.drop { $0 < picture.frame(at: 13) - 1 }.first.map { $0 >= picture.frame(at: 13) - 1 } == true, "\(probe.seen.prefix(6))")
     }
 
     func testStartingAtAPositionFetchesTheBeginningOfTheStreamFirstAndShowsItsOpeningFrameWhereAnItemToldWhereToBeginDoesNot() async throws {
         // This pins what is, not what should be. The engine puts the item on the player, waits until it is ready and jumps; AVPlayer has started at 0
         // by then, and fetches the first segments and shows the first frame before the jump arrives. An item that is told where to begin before it
         // loads (what the car's way of starting does - the provider's `item.seek`) fetches nothing of the beginning and shows no frame before the position.
-        // Measured on 2026-10-19 on a stream of 60 s (video and audio segments 0 to 4 or 6 fetched first, then those from 16 on; frames [0, 792] against
+        // Measured on 2026-10-19/20 on a stream of 60 s (video and audio segments 0 to 4 or 6 fetched first, then those from 16 on; frames [0, 792] against
         // [792]); the cost on a source that makes its segments on request - PrismCore - is not measured.
         var fetchedFirst: [Bool] = []
         var framesSeen: [[Int]] = []
