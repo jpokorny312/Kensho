@@ -9,7 +9,9 @@ import Foundation
 /// - A session an engine starts (`load`, `commitSwap`) begins **paused** at its
 ///   position; the reducer's `play` is what sets it going. An engine that
 ///   starts on its own plays a second or two of the wrong place before the
-///   jump to the start position lands.
+///   jump to the start position lands. (An owner that must not wait for its item can take that on and ask for an engine that plays at once:
+///   `AVPlayerEngine.Options.startsPlayingAtOnce`, the car's. What holds such an engine is the reducer's `pause`, which it also sends while the item
+///   is still loading.)
 /// - Every report carries the epoch of the session it is about. The reducer
 ///   drops what is about a session that is not (or no longer) the live one, so
 ///   an engine never has to hold a late report back - but it must not report a
