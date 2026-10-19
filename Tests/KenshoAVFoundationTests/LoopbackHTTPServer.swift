@@ -15,12 +15,8 @@ final class LoopbackHTTPServer: @unchecked Sendable {
     }
 
     struct Request: Equatable {
-        /// The request target as the client sent it (path and query).
-        var target: String
         var path: String
         var range: String?
-        /// `ProcessInfo.systemUptime` when the request was read.
-        var at: TimeInterval
     }
 
     private struct Parked {
@@ -185,7 +181,7 @@ final class LoopbackHTTPServer: @unchecked Sendable {
             let pair = line.split(separator: ":", maxSplits: 1)
             if pair.count == 2, pair[0].lowercased() == "range" { range = pair[1].trimmingCharacters(in: .whitespaces) }
         }
-        let request = Request(target: target, path: path, range: range, at: ProcessInfo.processInfo.systemUptime)
+        let request = Request(path: path, range: range)
         log.append(request)
         let isHead = method == "HEAD"
         guard method == "GET" || isHead else {

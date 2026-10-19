@@ -67,7 +67,8 @@ public final class AVPlayerEngine: PlaybackEngine {
             /// To the position asked for (the default; what a start position and a skip of a segment need).
             case exact
             /// Where AVPlayer lands most cheaply: at a keyframe or a segment start of a stream that is made of segments, without the cost of decoding up to
-            /// the exact position.
+            /// the exact position. (Measured on an HLS stream of audio: on the second where the part is loaded already, at the start of its segment where it
+            /// is not - 13.0 s lands at 12.005 s - and no different from the plain `seek(to:)`. For video: keyframes, not measured.)
             case cheapest
         }
 
@@ -234,7 +235,8 @@ public final class AVPlayerEngine: PlaybackEngine {
             // loads - and cannot go any further: AVFoundation refuses an item that has been on one
             // player on another (NSInvalidArgumentException, even after it was taken off the first,
             // and an exception through Swift's async frames ends the process). A copy has the same
-            // asset, so what was loaded is not loaded again, and the same settings.
+            // asset - the master playlist is not asked for again; the media is, measured on an HLS
+            // stream (AVPlayerEngineHLSTests) - and the same settings, the choice of tracks among them.
             session.statusObservation = nil
             staging.replaceCurrentItem(with: nil)
             let item = (prepared.copy() as? AVPlayerItem) ?? AVPlayerItem(asset: prepared.asset)

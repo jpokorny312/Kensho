@@ -282,11 +282,13 @@ final class AVPlayerEngineHLSTests: XCTestCase {
         XCTAssertNil(tag(item, legible), "subtitles off")
         XCTAssertEqual(tag(item, audible), "en")
 
-        // A number the stream has no option for changes nothing: for the subtitles it used to turn them off.
-        await AVPlayerEngine.defaultApplier(item, TrackSelection(audio: 1, subtitle: 1))
+        // A number the stream has no option for changes nothing: for the subtitles it used to turn them off. (Tried from the first option for a number
+        // above the last, and from the last for one below the first: a number cut to the nearest option would not pass for "changes nothing".)
+        await AVPlayerEngine.defaultApplier(item, TrackSelection(audio: 0, subtitle: 0))
         await AVPlayerEngine.defaultApplier(item, TrackSelection(audio: 7, subtitle: 7))
-        XCTAssertEqual(tag(item, audible), "de", "what the viewer had stays")
-        XCTAssertEqual(tag(item, legible), "de", "and the subtitles are not turned off by a number that is no option")
+        XCTAssertEqual(tag(item, audible), "en", "what the viewer had stays")
+        XCTAssertEqual(tag(item, legible), "en", "and the subtitles are not turned off by a number that is no option")
+        await AVPlayerEngine.defaultApplier(item, TrackSelection(audio: 1, subtitle: 1))
         await AVPlayerEngine.defaultApplier(item, TrackSelection(audio: -1, subtitle: -1))
         XCTAssertEqual(tag(item, audible), "de")
         XCTAssertEqual(tag(item, legible), "de")
@@ -315,14 +317,14 @@ final class AVPlayerEngineHLSTests: XCTestCase {
         h.engine.perform(.applySelection(Epoch(1), TrackSelection(audio: 0, subtitle: 1)))
         let changed = await h.wait { self.tag(item, audible) == "en" && self.tag(item, legible) == "de" }
         XCTAssertTrue(changed)
-        let German = await h.wait { hls.server.requestedPaths.contains(hls.subtitleSegmentPath(code: "de")) }
-        XCTAssertTrue(German, "requests: \(hls.server.requestedPaths)")
+        let subtitleLoaded = await h.wait { hls.server.requestedPaths.contains(hls.subtitleSegmentPath(code: "de")) }
+        XCTAssertTrue(subtitleLoaded, "requests: \(hls.server.requestedPaths)")
     }
 
     // MARK: - Jumping in a stream of segments
 
     func testAStartPositionInAnHLSStreamIsReachedOnTheSecondAndNotAtTheSegmentBefore() async throws {
-        let (h, hls) = try await rig()
+        let (h, _) = try await rig()
         let ready = await load(h, startAt: 13)
         XCTAssertTrue(ready, "events: \(h.events)")
         XCTAssertEqual(h.player.currentTime().seconds, 13, accuracy: 0.05, "not the 12.0 at which its segment begins")
@@ -331,7 +333,6 @@ final class AVPlayerEngineHLSTests: XCTestCase {
         let playsOn = await h.wait { (h.lastTick(of: Epoch(1)) ?? 0) > 13.5 }
         XCTAssertTrue(playsOn)
         XCTAssertGreaterThan(h.ticks(of: Epoch(1)).first ?? 0, 12.9, "and never from the start: \(h.ticks(of: Epoch(1)).prefix(3))")
-        _ = hls
     }
 
     func testAJumpInAnHLSStreamLandsOnTheSecondAndIsReportedWithItsToken() async throws {
@@ -404,6 +405,65 @@ final class AVPlayerEngineHLSTests: XCTestCase {
         }
     }
 
+    // MARK: - An engine that plays at once (the car's) on a stream
+
+    func testAnEngineThatStartsAtOnceStartsAnHLSStreamWithoutAStallAndWithoutAPlayInstruction() async throws {
+        let (h, _) = try await rig(options: .init(startsPlayingAtOnce: true))
+        h.engine.perform(.load(Epoch(1), film, startAt: 0, selection: none, quality: nil))
+        let ready = await h.waitFor(.engineReady(Epoch(1)))
+        XCTAssertTrue(ready, "events: \(h.events)")
+        XCTAssertGreaterThan(h.player.rate, 0, "no `play` was performed: the item was set going as it went on the player")
+        let moved = await h.wait { (h.lastTick(of: Epoch(1)) ?? 0) > 1 }
+        XCTAssertTrue(moved, "and it runs: \(h.events.suffix(6))")
+        XCTAssertEqual(h.stalls(of: Epoch(1)), 0, "the wait of its start is a start")
+    }
+
+    func testAnEngineThatStartsAtOnceDoesNotPlayAnHLSStreamThatArrivesAfterAPause() async throws {
+        let (h, _) = try await rig(options: .init(startsPlayingAtOnce: true))
+        h.engine.perform(.load(Epoch(1), film, startAt: 0, selection: none, quality: nil))
+        h.engine.perform(.pause(Epoch(1)))       // before the provider has answered
+        let ready = await h.waitFor(.engineReady(Epoch(1)))
+        XCTAssertTrue(ready, "events: \(h.events)")
+        try await Task.sleep(nanoseconds: 700_000_000)
+        XCTAssertEqual(h.player.rate, 0, "held: the pause came before the item did")
+        XCTAssertLessThan(h.player.currentTime().seconds, 0.3)
+        h.engine.perform(.play(Epoch(1)))
+        let moved = await h.wait { (h.lastTick(of: Epoch(1)) ?? 0) > 0.6 }
+        XCTAssertTrue(moved, "and the play after it sets it going: \(h.events.suffix(6))")
+    }
+
+    func testAnHLSItemThatWasToldWhereToBeginBeginsThereWhenTheEnginePlaysAtOnce() async throws {
+        // The engine neither jumps nor waits for a jump: the position is the provider's. How exactly the item lands is the provider's choice as well - with
+        // the tolerances of the plain `seek(to:)` (the car's way) a stream of segments begins at the start of the segment that holds the target:
+        // 10.0 s for the 12.0 s asked for here, a whole segment before it.
+        for (exact, label) in [(true, "exact"), (false, "plain")] {
+            let (h, hls) = try await rig(options: .init(startsPlayingAtOnce: true))
+            h.make = { [unowned hls] _, _ in
+                let item = AVPlayerItem(url: hls.masterURL("hi"))
+                let time = CMTime(seconds: 12, preferredTimescale: 600)
+                if exact {
+                    item.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero, completionHandler: nil)
+                } else {
+                    item.seek(to: time, completionHandler: nil)
+                }
+                return item
+            }
+            h.engine.perform(.load(Epoch(1), film, startAt: 12, selection: none, quality: nil))
+            let ready = await h.waitFor(.engineReady(Epoch(1)))
+            XCTAssertTrue(ready, "\(label): \(h.events)")
+            let moved = await h.wait { (h.lastTick(of: Epoch(1)) ?? 0) > 12.4 }
+            XCTAssertTrue(moved, "\(label): it runs on past the 12 s: \(h.ticks(of: Epoch(1)).prefix(4))")
+            let first = h.ticks(of: Epoch(1)).first ?? 0
+            if exact {
+                XCTAssertGreaterThan(first, 11.8, "\(label): from the 12 s the item was told, never from the start: \(h.ticks(of: Epoch(1)).prefix(4))")
+            } else {
+                XCTAssertGreaterThan(first, hls.segmentStart(hls.segmentIndex(at: 12)) - 0.1, "\(label): from its segment, never from the start: \(h.ticks(of: Epoch(1)).prefix(4))")
+                XCTAssertLessThan(first, 12.1, "\(label): and no later than the target: \(h.ticks(of: Epoch(1)).prefix(4))")
+            }
+            XCTAssertEqual(h.stalls(of: Epoch(1)), 0, label)
+        }
+    }
+
     // MARK: - Making a replacement of one stream by another
 
     func testAnHLSStreamIsReplacedByAnotherWhileItPlaysAndTheOtherTakesOverWhereThePlayerIs() async throws {
@@ -440,7 +500,9 @@ final class AVPlayerEngineHLSTests: XCTestCase {
         XCTAssertFalse(h.events.contains { isFailure($0) })
     }
 
-    func testTheReplacementCarriesTheViewersTracksThoughTheCopyDoesNotKeepThePreparedItemsChoice() async throws {
+    func testTheReplacementThatTookOverHasTheViewersTracks() async throws {
+        // (The prepared item on the staging player never got a choice - the choice is the live session's, applied when a session is up. The one that took
+        // over gets it from the engine, whatever a copy brings along.)
         let (h, hls) = try await rig()
         let ready = await load(h, selection: TrackSelection(audio: 1, subtitle: 1))
         XCTAssertTrue(ready)
@@ -456,6 +518,37 @@ final class AVPlayerEngineHLSTests: XCTestCase {
         let (audible, legible) = try await groups(of: item)
         XCTAssertEqual(tag(item, audible), "de", "the choice is made again on the item that took over")
         XCTAssertEqual(tag(item, legible), "de")
+    }
+
+    /// What `commitSwap` leans on, as AVFoundation does it (macOS 27): the copy is ready at once, has the media selection of the original, and takes the
+    /// master playlist from the asset instead of asking the server again. (The media playlist of the rendition that is selected, its initialization segment
+    /// and the segments are asked for again - the engine's comment "what was loaded is not loaded again" holds for the master only.)
+    func testACopyOfAnHLSItemIsReadyAtOnceKeepsTheChoiceOfTracksAndNeedsNoMasterPlaylistAgain() async throws {
+        let hls = try await HLSFixture.start(seconds: 10)
+        let staging = AVPlayer()
+        staging.isMuted = true
+        let item = AVPlayerItem(url: hls.masterURL("lo"))
+        staging.replaceCurrentItem(with: item)
+        let h = try EngineHarness()
+        let prepared = await h.wait { item.status == .readyToPlay }
+        XCTAssertTrue(prepared, "\(String(describing: item.error))")
+        let (audible, legible) = try await groups(of: item)
+        await AVPlayerEngine.defaultApplier(item, TrackSelection(audio: 1, subtitle: 1))
+        try await Task.sleep(nanoseconds: 600_000_000)       // what the choice makes the player ask for is asked for before the copy is made
+        staging.replaceCurrentItem(with: nil)
+
+        let before = hls.server.requestedPaths.count
+        let copy = try XCTUnwrap(item.copy() as? AVPlayerItem)
+        XCTAssertEqual(tag(copy, audible), "de", "the choice goes with the copy, before it is on any player")
+        XCTAssertEqual(tag(copy, legible), "de")
+        let player = AVPlayer()
+        player.isMuted = true
+        player.replaceCurrentItem(with: copy)
+        let ready = await h.wait(timeout: 5) { copy.status == .readyToPlay }
+        XCTAssertTrue(ready, "\(String(describing: copy.error))")
+        let again = Array(hls.server.requestedPaths.dropFirst(before))
+        XCTAssertFalse(again.contains(hls.masterPath("lo")), "the master playlist is not asked for again: \(again)")
+        XCTAssertEqual(tag(copy, audible), "de")
     }
 
     func testAReplacementWhoseStreamIsNotThereIsAFailedSwapAndTheRunningStreamPlaysOn() async throws {
@@ -493,7 +586,7 @@ final class AVPlayerEngineHLSTests: XCTestCase {
     /// posts `AVPlayerItemFailedToPlayToEndTime` (`NSURLErrorDomain -1100`) after some twenty seconds - while `item.status` stays `readyToPlay`.
     /// Measured on 2026-10-19: 22 s after the wait began. The notification is the way the engine hears of it.
     func testAStreamThatDiesWhilePlayingIsStalledForAWhileAndThenFailsWithTheNotification() async throws {
-        try XCTSkipUnless(ProcessInfo.processInfo.environment["KENSHO_SLOW_TESTS"] != nil, "about 25 s: set KENSHO_SLOW_TESTS=1 to run it")
+        try XCTSkipUnless(ProcessInfo.processInfo.environment["KENSHO_SLOW_TESTS"] != nil, "about 30 s: set KENSHO_SLOW_TESTS=1 to run it")
         let (h, hls) = try await rig()
         for rendition in HLSFixture.audioRenditions { hls.server.fail(hls.segmentPath(audio: rendition.code, 4), status: 404) }
         let ready = await load(h)
