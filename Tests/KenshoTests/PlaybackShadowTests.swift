@@ -245,7 +245,7 @@ final class PlaybackShadowTests: XCTestCase {
         shadow.replacementPlays(true)
         // What the Apple TV does after the trip through the background: player.pause() a moment after the replacement.
         now += 0.016
-        shadow.pause()
+        shadow.appPauses()
         XCTAssertTrue(memory.contains("set the viewer's pause back"), "lines: \(memory.lines)")
         shadow.playerIsReady()
         XCTAssertEqual(shadow.state.phase, .paused)
@@ -255,6 +255,24 @@ final class PlaybackShadowTests: XCTestCase {
         }
         XCTAssertFalse(memory.contains("DEVIATION"), "lines: \(memory.lines)")
         XCTAssertEqual(shadow.deviationCount, 0)
+    }
+
+    func testAPauseOfTheViewerAfterTheReplacementIsNotTakenForTheAppsRepair() {
+        let shadow = makeShadow()
+        startedPlaying(shadow)
+        shadow.pause()
+        shadow.begin(item: "film", startAt: 50, quality: "original", audio: 1, subtitle: nil, reason: "rebuild", startsPlayback: false)
+        shadow.replacementPlays(true)
+        // He notices that it plays and pauses again. The hook cannot tell that from the app's own pause; the call the app's repair makes is another.
+        now += 3
+        shadow.pause()
+        XCTAssertFalse(memory.contains("set the viewer's pause back"), "the app did not do that: \(memory.lines)")
+        shadow.playerIsReady()
+        for _ in 0..<8 {
+            now += 0.5
+            shadow.compare(with: app(wantsToPlay: false, position: 50))
+        }
+        XCTAssertFalse(memory.contains("DEVIATION"), "lines: \(memory.lines)")
     }
 
     func testTheViewerPlayingAfterTheReplacementEndsTheCause() {
@@ -281,6 +299,56 @@ final class PlaybackShadowTests: XCTestCase {
         shadow.pause()
         shadow.replacementPlays(false)      // paused, and the app leaves it so
         XCTAssertFalse(memory.contains("DEVIATION"), "lines: \(memory.lines)")
+    }
+
+    func testAJumpThatWasNotSentYetIsNoDisagreementAboutThePosition() {
+        let shadow = makeShadow()
+        startedPlaying(shadow)
+        // The skip buttons were tapped again and again: the app shows the position it will jump to, and sends the jump when the taps stop.
+        for _ in 0..<12 {
+            now += 0.5
+            shadow.compare(with: app(unsentJump: true, position: 400))
+        }
+        XCTAssertFalse(memory.contains("DEVIATION"), "lines: \(memory.lines)")
+        // The same position with nothing waiting to be sent is a player somewhere else.
+        for _ in 0..<10 {
+            now += 0.5
+            shadow.compare(with: app(position: 400))
+        }
+        XCTAssertTrue(memory.contains("DEVIATION position"), "lines: \(memory.lines)")
+    }
+
+    func testOnlyTheNewestInstructionsAreKept() {
+        let shadow = makeShadow()
+        startedPlaying(shadow)
+        for second in 0..<600 { shadow.seek(to: Double(second)) }
+        XCTAssertEqual(shadow.instructions.count, 500)
+        guard case .seek(_, _, let position) = shadow.instructions.last else { return XCTFail("the last instruction is a jump: \(String(describing: shadow.instructions.last))") }
+        XCTAssertEqual(position, 599)
+    }
+
+    func testAnAttemptThatIsGivenUpPutsTheStateMachineBackWhereThePlayerIs() {
+        let shadow = makeShadow()
+        startedPlaying(shadow, at: 30)
+        // The app began to get another stream (a new track, the way back from the background) and told the state machine the stream failed ...
+        shadow.playerFailed("the stream is made again")
+        XCTAssertEqual(shadow.state.phase, .failed("the stream is made again"))
+        // ... and could not get it. The old stream plays on, the app is back to normal.
+        shadow.attemptGivenUp(item: "film", at: 31, quality: "original", audio: 1, subtitle: nil)
+        XCTAssertEqual(shadow.state.phase, .playing)
+        for _ in 0..<12 {
+            now += 0.5
+            shadow.compare(with: app(position: 31))
+        }
+        XCTAssertFalse(memory.contains("DEVIATION"), "lines: \(memory.lines)")
+    }
+
+    func testAnAttemptIsOnlyGivenUpWhereTheStateMachineWasToldItFailed() {
+        let shadow = makeShadow()
+        startedPlaying(shadow)
+        shadow.attemptGivenUp(item: "film", at: 5, quality: "original", audio: 1, subtitle: nil)
+        XCTAssertEqual(shadow.state.phase, .playing)
+        XCTAssertFalse(memory.contains("attempt given up"), "nothing to put back: \(memory.lines)")
     }
 
     func testAnItemTheViewerStartsPlaysWhateverWasBefore() {

@@ -50,7 +50,12 @@ public final class PlaybackShadow {
     private final class NullEngine: PlaybackEngine {
         var onEvent: ((PlaybackEvent) -> Void)?
         private(set) var performed: [PlaybackEffect] = []
-        func perform(_ effect: PlaybackEffect) { performed.append(effect) }
+        /// How many of the newest instructions are kept: a viewer who jumps a thousand times must not make this grow with the film.
+        static let kept = 500
+        func perform(_ effect: PlaybackEffect) {
+            performed.append(effect)
+            if performed.count > Self.kept { performed.removeFirst(performed.count - Self.kept) }
+        }
     }
 
     /// How long a disagreement has to last before it is one. The two sides report to each other through events that take a moment (a jump is
@@ -154,7 +159,18 @@ public final class PlaybackShadow {
         coordinator.play()
     }
 
+    /// The viewer pauses (or something outside the app does: the lock screen, AirPods, the sleep timer). A pause ends the cause that
+    /// `replacementPlays` named: the player is not playing under him any more, whoever stopped it.
     public func pause() {
+        guard !isEnded else { return }
+        resumedByReplacementAt = nil
+        coordinator.pause()
+    }
+
+    /// The app pauses by itself, to set the viewer's pause back after it replaced the stream under him (the Apple TV does when it comes back from the
+    /// background and has rebuilt the stream). It is a call of its own because `pause()` cannot tell the app from the viewer, who may have noticed
+    /// and paused again: only a call that is the app's own can say that the app set the pause back.
+    public func appPauses() {
         guard !isEnded else { return }
         if let at = resumedByReplacementAt {
             resumedByReplacementAt = nil
@@ -219,6 +235,14 @@ public final class PlaybackShadow {
         guard !isEnded else { return }
         let s = coordinator.state
         coordinator.send(s.phase == .switching ? .swapFinished(s.epoch) : .engineReady(s.epoch))
+    }
+
+    /// The app has told the state machine that the stream failed - it began to get another one - and gives up on that: it goes on with the one
+    /// it has. The state machine is put back where the player is. (Nothing is said when it is not failed: the attempt may have got somewhere.)
+    public func attemptGivenUp(item: String, at position: TimeInterval, quality: String?, audio: Int?, subtitle: Int?) {
+        guard !isEnded, case .failed = coordinator.state.phase else { return }
+        begin(item: item, startAt: position, quality: quality, audio: audio, subtitle: subtitle, reason: "attempt given up, the stream goes on", startsPlayback: false)
+        playerIsReady()
     }
 
     public func playerFailed(_ reason: String) {
@@ -286,7 +310,8 @@ public final class PlaybackShadow {
         if s.swap != nil, !app.isChangingQuality {
             found["swap"] = "the state machine has a replacement on its way (\(s.swap?.quality.id ?? "?")), the app is not changing the quality"
         }
-        if s.isSteady, abs(app.position - s.position) > 5 {
+        // (A jump the app has gathered taps for and not sent yet has moved its position already: that is not the player being somewhere else.)
+        if s.isSteady, !app.hasUnsentJump, abs(app.position - s.position) > 5 {
             found["position"] = "the player is at \(Self.seconds(app.position)); the state machine at \(Self.seconds(s.position))"
         }
 
