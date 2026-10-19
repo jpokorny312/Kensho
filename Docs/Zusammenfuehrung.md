@@ -100,7 +100,7 @@ Bewusst nicht übernommen, mit Grund: **6b** (die Warteschlange der Sprung-Rück
 
 ## Der Schatten in Ensō (Schritt 1 der offenen Arbeit)
 
-**Gebaut** auf dem Ensō-Zweig `claude/kensho-shadow` (lokal, nicht gepusht; `Scripts/kensho-sync.sh` hält `Kensho/` in Ensō und dieses Repository gleich). Beide `PlayerView`s wurden vollständig gelesen, bevor ein Haken gesetzt wurde. Neben dem alten Code läuft ein `PlaybackShadow`; die Haken stehen neben der Zeile, die der alte Code ohnehin ausführt, und ändern nichts am Ablauf:
+**Gebaut** auf dem Ensō-Zweig `claude/kensho-shadow` (seit dem 2026-10-19 auf `main`, lokal, nicht gepusht; `Scripts/kensho-sync.sh` hält `Kensho/` in Ensō und dieses Repository gleich). Beide `PlayerView`s wurden vollständig gelesen, bevor ein Haken gesetzt wurde. Neben dem alten Code läuft ein `PlaybackShadow`; die Haken stehen neben der Zeile, die der alte Code ohnehin ausführt, und ändern nichts am Ablauf:
 
 | Wo der alte Code … | … sagt der Haken dem Schatten |
 |---|---|
