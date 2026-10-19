@@ -79,6 +79,10 @@ public enum PlaybackReducer {
             case .seeking:
                 // The engine may auto-resume after the jump; make it hold.
                 fx.append(.pause(s.epoch))
+            case .loading:
+                // Under the contract nothing plays yet (a session starts paused), so to such an engine this is a pause of a paused player. An
+                // engine that plays at once (`AVPlayerEngine.Options.startsPlayingAtOnce`: the car's) has to be told to hold - nothing else would.
+                fx.append(.pause(s.epoch))
             default:
                 break
             }

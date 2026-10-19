@@ -332,6 +332,18 @@ final class PlaybackReducerTests: XCTestCase {
         XCTAssertTrue(fx.isEmpty)
     }
 
+    func testAPauseWhileTheItemLoadsTellsTheEngineToHoldAndTheItBeginsPaused() {
+        let (loading, _) = run([.load(source, startAt: 0, selection: TrackSelection(), quality: hi)])
+        XCTAssertEqual(loading.phase, .loading)
+        let (paused, fx) = run([.pause], from: loading)
+        XCTAssertFalse(paused.wantsPlay)
+        XCTAssertEqual(paused.phase, .loading, "the item is still on its way")
+        XCTAssertEqual(fx, [.pause(Epoch(1))], "an engine that plays at once (the car's) has nothing else that holds it; to one that waits it is a pause of a paused player")
+        let (ready, readyFx) = run([.engineReady(Epoch(1))], from: paused)
+        XCTAssertEqual(ready.phase, .paused, "and it begins paused")
+        XCTAssertTrue(readyFx.isEmpty, "with no play")
+    }
+
     func testAnIntentWithoutASessionIsStillIgnored() {
         let (s, fx) = run([.pause, .play, .seek(to: 5)])
         XCTAssertEqual(s, PlaybackState(), "nothing is loaded: there is nothing to want")

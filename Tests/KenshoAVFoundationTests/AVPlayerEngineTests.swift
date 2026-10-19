@@ -23,7 +23,7 @@ private final class EngineHarness {
     /// What the provider does, per call. Replaced by tests that need a slow or failing one.
     var make: ((MediaSource, QualityChoice?) async throws -> AVPlayerItem)?
 
-    init(applier: AVPlayerEngine.SelectionApplier? = nil) throws {
+    init(applier: AVPlayerEngine.SelectionApplier? = nil, options: AVPlayerEngine.Options = AVPlayerEngine.Options()) throws {
         directory = try TestMedia.makeDirectory()
         player.isMuted = true
         engine = AVPlayerEngine(
@@ -39,7 +39,8 @@ private final class EngineHarness {
                 guard let url = self.files[key] ?? self.files[source.id] else { throw Failure.noItem(key) }
                 return AVPlayerItem(url: url)
             },
-            applier: applier
+            applier: applier,
+            options: options
         )
         engine.onEvent = { [weak self] in self?.events.append($0) }
     }
@@ -83,8 +84,8 @@ final class AVPlayerEngineTests: XCTestCase {
     private let film = MediaSource(id: "film", range: .sdr)
     private let none = TrackSelection()
 
-    private func harness(applier: AVPlayerEngine.SelectionApplier? = nil) throws -> EngineHarness {
-        let h = try EngineHarness(applier: applier)
+    private func harness(applier: AVPlayerEngine.SelectionApplier? = nil, options: AVPlayerEngine.Options = AVPlayerEngine.Options()) throws -> EngineHarness {
+        let h = try EngineHarness(applier: applier, options: options)
         try h.addFile("film", seconds: 30)
         try h.addFile("film-lo", seconds: 20)
         return h
@@ -102,6 +103,76 @@ final class AVPlayerEngineTests: XCTestCase {
         try await Task.sleep(nanoseconds: 700_000_000)
         XCTAssertEqual(h.player.currentTime().seconds, 4, accuracy: 0.2, "it stayed where it was told to wait")
         XCTAssertEqual(h.provided.count, 1)
+    }
+
+    // MARK: - An engine that plays at once (the car's)
+
+    func testAnEngineThatStartsAtOnceIsPlayingWhenItReportsReadyAndWasNeverToldToPlay() async throws {
+        let h = try harness(options: .init(startsPlayingAtOnce: true))
+        h.engine.perform(.load(Epoch(1), film, startAt: 0, selection: none, quality: nil))
+        let ready = await h.waitFor(.engineReady(Epoch(1)))
+        XCTAssertTrue(ready, "events: \(h.events)")
+        XCTAssertGreaterThan(h.player.rate, 0, "no `play` was performed: the item was set going as it went on the player")
+        let moved = await h.wait { (h.lastTick(of: Epoch(1)) ?? 0) > 0.8 }
+        XCTAssertTrue(moved, "and it runs: \(h.events)")
+    }
+
+    func testAnEngineThatStartsAtOnceDoesNotPlayAnItemThatArrivesAfterAPause() async throws {
+        let h = try harness(options: .init(startsPlayingAtOnce: true))
+        h.engine.perform(.load(Epoch(1), film, startAt: 0, selection: none, quality: nil))
+        h.engine.perform(.pause(Epoch(1)))       // before the provider has answered
+        let ready = await h.waitFor(.engineReady(Epoch(1)))
+        XCTAssertTrue(ready, "events: \(h.events)")
+        try await Task.sleep(nanoseconds: 700_000_000)
+        XCTAssertEqual(h.player.rate, 0, "held: the pause came before the item did")
+        XCTAssertLessThan(h.player.currentTime().seconds, 0.3)
+        h.engine.perform(.play(Epoch(1)))
+        let moved = await h.wait { (h.lastTick(of: Epoch(1)) ?? 0) > 0.6 }
+        XCTAssertTrue(moved, "and the play after it sets it going: \(h.events)")
+    }
+
+    func testAnEngineThatStartsAtOnceLeavesTheStartPositionToTheItem() async throws {
+        // The provider's item was not told to begin anywhere. The default engine would jump to the 10 s it was asked for and wait for the landing; this one
+        // plays from where the item begins.
+        let h = try harness(options: .init(startsPlayingAtOnce: true))
+        h.engine.perform(.load(Epoch(1), film, startAt: 10, selection: none, quality: nil))
+        await h.waitFor(.engineReady(Epoch(1)))
+        try await Task.sleep(nanoseconds: 700_000_000)
+        XCTAssertLessThan(h.player.currentTime().seconds, 4, "it did not jump to the start position: \(h.player.currentTime().seconds)")
+        XCTAssertEqual(h.requests.first?.startAt, 10, "the provider was told where the film is wanted: it is the one who positions the item")
+    }
+
+    func testAnItemThatWasToldWhereToBeginBeginsThereWhenTheEnginePlaysAtOnce() async throws {
+        let h = try harness(options: .init(startsPlayingAtOnce: true))
+        h.make = { [unowned h] _, _ in
+            let item = AVPlayerItem(url: h.files["film"]!)
+            item.seek(to: CMTime(seconds: 12, preferredTimescale: 600), completionHandler: nil)
+            return item
+        }
+        h.engine.perform(.load(Epoch(1), film, startAt: 12, selection: none, quality: nil))
+        await h.waitFor(.engineReady(Epoch(1)))
+        let moved = await h.wait { (h.lastTick(of: Epoch(1)) ?? 0) > 12.4 }
+        XCTAssertTrue(moved, "it runs from the 12 s the item was told: \(h.ticks(of: Epoch(1)).prefix(4))")
+        XCTAssertGreaterThan(h.ticks(of: Epoch(1)).first ?? 0, 11.5, "and never from the start: \(h.ticks(of: Epoch(1)).prefix(4))")
+    }
+
+    func testTheDefaultEngineStillWaitsForThePlayInstruction() async throws {
+        let h = try harness()
+        h.engine.perform(.load(Epoch(1), film, startAt: 0, selection: none, quality: nil))
+        await h.waitFor(.engineReady(Epoch(1)))
+        XCTAssertEqual(h.player.rate, 0)
+    }
+
+    func testACheapJumpLands() async throws {
+        let h = try harness(options: .init(jumps: .cheapest))
+        h.engine.perform(.load(Epoch(1), film, startAt: 0, selection: none, quality: nil))
+        await h.waitFor(.engineReady(Epoch(1)))
+        h.engine.perform(.play(Epoch(1)))
+        h.clearEvents()
+        h.engine.perform(.seek(Epoch(1), SeekToken(1), to: 20))
+        let landed = await h.waitFor(.seekFinished(Epoch(1), SeekToken(1)))
+        XCTAssertTrue(landed, "events: \(h.events)")
+        XCTAssertEqual(h.player.currentTime().seconds, 20, accuracy: 1.5, "(a file of audio has no keyframes to snap to: this checks that the jump is made and answered; what a segmented stream does with it is for one to show)")
     }
 
     func testPlayRunsFromThereAndEveryTickCarriesTheEpoch() async throws {

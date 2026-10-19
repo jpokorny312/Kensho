@@ -76,7 +76,7 @@ final class PlaybackCoordinatorTests: XCTestCase {
             .engineReady(Epoch(99)),
             .pause,
         ])
-        XCTAssertEqual(effectCounts, [1, 0, 0], "load asked the engine for one thing; the stale report and the pause during loading asked for nothing")
+        XCTAssertEqual(effectCounts, [1, 0, 1], "load asked the engine for one thing, the stale report for nothing, the pause during loading for one (an engine that plays at once is held)")
     }
 
     func testTheTransitionHookRunsBeforeTheEngineGetsTheEffects() {

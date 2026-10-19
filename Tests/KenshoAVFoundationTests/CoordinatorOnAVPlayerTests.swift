@@ -20,7 +20,7 @@ private final class Rig {
     var now: TimeInterval = 1_000
     var files: [String: URL] = [:]
 
-    init() throws {
+    init(options: AVPlayerEngine.Options = AVPlayerEngine.Options()) throws {
         directory = try TestMedia.makeDirectory()
         files["film"] = try TestMedia.silentAudio(seconds: 40, in: directory, name: "film")
         files["film-lo"] = try TestMedia.silentAudio(seconds: 40, in: directory, name: "film-lo")
@@ -34,7 +34,8 @@ private final class Rig {
                 }
                 return AVPlayerItem(url: url)
             },
-            applier: { [weak self] _, selection in self?.applied.append(selection) }
+            applier: { [weak self] _, selection in self?.applied.append(selection) },
+            options: options
         )
         coordinator = PlaybackCoordinator(engine: engine, clock: { [weak self] in self?.now ?? 0 })
         // The phases the film went through: a state change that only moved the position is not one.
@@ -68,6 +69,29 @@ final class CoordinatorOnAVPlayerTests: XCTestCase {
     private let film = MediaSource(id: "film", range: .sdr)
     private let hi = QualityChoice(id: "hi", range: .sdr)
     private let lo = QualityChoice(id: "lo", range: .sdr)
+
+    func testAViewerWhoPausesWhileTheItemLoadsHoldsAnEngineThatPlaysAtOnce() async throws {
+        let rig = try Rig(options: .init(startsPlayingAtOnce: true))
+        rig.coordinator.load(film)
+        rig.coordinator.pause()      // the item is on its way: the engine would play the moment it has it
+        let paused = await rig.wait { rig.state.phase == .paused }
+        XCTAssertTrue(paused, "the item came and the viewer's pause is what it begins with: \(rig.phases)")
+        try await Task.sleep(nanoseconds: 700_000_000)
+        XCTAssertEqual(rig.player.rate, 0, "held")
+        XCTAssertLessThan(rig.player.currentTime().seconds, 0.5, "not a moment of it played")
+        rig.coordinator.play()
+        let played = await rig.waitUntilPlayingPast(0.6)
+        XCTAssertTrue(played, "and his play sets it going: \(rig.phases)")
+    }
+
+    func testAnEngineThatPlaysAtOnceAndAViewerWhoDoesNotPauseBeginsToPlayAndTheStateFollows() async throws {
+        let rig = try Rig(options: .init(startsPlayingAtOnce: true))
+        rig.coordinator.load(film)
+        let playing = await rig.waitUntilPlayingPast(0.8)
+        XCTAssertTrue(playing, "phases: \(rig.phases)")
+        XCTAssertEqual(rig.phases.first, .loading)
+        XCTAssertFalse(rig.effects.contains { if case .pause = $0 { return true } else { return false } }, "nothing held it: \(rig.effects)")
+    }
 
     func testALoadPlaysFromTheStartPositionAndThePositionFollows() async throws {
         let rig = try Rig()

@@ -52,6 +52,31 @@ public final class AVPlayerEngine: PlaybackEngine {
     /// Calls for one session never overlap and never run in the wrong order.
     public typealias SelectionApplier = @MainActor (AVPlayerItem, TrackSelection) async -> Void
 
+    /// Where the default does not fit the engine's owner.
+    public struct Options: Equatable, Sendable {
+        /// An item is played as soon as it is on the player, not when the state machine has the session at its start position and says `play`.
+        /// For an owner that must not wait for its item - CarPlay's: the car shows its picture when the player plays, and a player that waited for the
+        /// car to answer first would keep the car waiting for the player. The start position is then the provider's business (an item that was told where
+        /// to begin, `AVPlayerItem.seek(to:completionHandler:)` before it loads): the engine neither jumps to it nor waits for a jump. Applies to a
+        /// `load` and not to a quality replacement (which takes over paused and plays when the state machine says so). The reducer holds the player
+        /// with a `pause` where the viewer pauses while the item loads.
+        public var startsPlayingAtOnce: Bool
+        /// How exactly the jumps of the viewer land.
+        public var jumps: Jumps
+        public enum Jumps: Equatable, Sendable {
+            /// To the position asked for (the default; what a start position and a skip of a segment need).
+            case exact
+            /// Where AVPlayer lands most cheaply: at a keyframe or a segment start of a stream that is made of segments, without the cost of decoding up to
+            /// the exact position.
+            case cheapest
+        }
+
+        public init(startsPlayingAtOnce: Bool = false, jumps: Jumps = .exact) {
+            self.startsPlayingAtOnce = startsPlayingAtOnce
+            self.jumps = jumps
+        }
+    }
+
     /// How often a seek that ended without the reducer having asked for a newer
     /// one is tried again before the session is given up.
     private static let maxSeekAttempts = 3
@@ -78,6 +103,11 @@ public final class AVPlayerEngine: PlaybackEngine {
         }
 
         let epoch: Epoch
+        /// This session plays as soon as its item is on the player (`Options.startsPlayingAtOnce`; set for a load).
+        var startsAtOnce = false
+        /// The reducer has told the session to hold (`pause`) and not to go (`play`) since: an item that arrives now is not set going, whatever
+        /// `startsAtOnce` says. (The viewer who pauses while the item loads.)
+        var held = false
         /// What the reducer is told when the session is at its position: a
         /// fresh load is `engineReady`, a replacement that took over is
         /// `swapFinished`.
@@ -111,6 +141,7 @@ public final class AVPlayerEngine: PlaybackEngine {
 
     private let provider: ItemProvider
     private let applier: SelectionApplier
+    private let options: Options
     private let log: KenshoLog
     /// The session whose item is on `player`.
     private var live: Session?
@@ -142,11 +173,13 @@ public final class AVPlayerEngine: PlaybackEngine {
         player: AVPlayer = AVPlayer(),
         provider: @escaping ItemProvider,
         applier: SelectionApplier? = nil,
+        options: Options = Options(),
         log: KenshoLog = .silent
     ) {
         self.player = player
         self.provider = provider
         self.applier = applier ?? AVPlayerEngine.defaultApplier
+        self.options = options
         self.log = log
         observePlayer()
     }
@@ -167,6 +200,7 @@ public final class AVPlayerEngine: PlaybackEngine {
             player.pause()
             self.source = source
             let session = Session(epoch: epoch, atPosition: { .engineReady($0) })
+            session.startsAtOnce = options.startsPlayingAtOnce
             session.startAt = startAt
             session.selection = selection
             live = session
@@ -211,12 +245,14 @@ public final class AVPlayerEngine: PlaybackEngine {
             endReplacement()
 
         case let .play(epoch):
-            guard live?.epoch == epoch else { return }
+            guard let session = live, session.epoch == epoch else { return }
+            session.held = false
             expectsPlaying = true
             player.play()
 
         case let .pause(epoch):
-            guard live?.epoch == epoch else { return }
+            guard let session = live, session.epoch == epoch else { return }
+            session.held = true
             expectsPlaying = false
             player.pause()
 
@@ -287,7 +323,8 @@ public final class AVPlayerEngine: PlaybackEngine {
     /// Puts the item on `player`, paused: a session starts where it is told to
     /// and plays when the reducer says so. AVPlayer keeps its rate across
     /// `replaceCurrentItem`, so without the pause an item that replaces a
-    /// playing one starts playing by itself.
+    /// playing one starts playing by itself. (A session that starts at once - see
+    /// `Options.startsPlayingAtOnce` - is set going as the item goes on.)
     private func attachToPlayer(_ session: Session, item: AVPlayerItem) {
         session.stage = .starting
         session.item = item
@@ -301,9 +338,11 @@ public final class AVPlayerEngine: PlaybackEngine {
                 self.fail(session, error: error)
             }
         }
-        expectsPlaying = false
+        let setsGoing = session.startsAtOnce && !session.held
+        expectsPlaying = setsGoing
         player.pause()
         player.replaceCurrentItem(with: item)
+        if setsGoing { player.play() }
     }
 
     private func attachToStaging(_ session: Session, item: AVPlayerItem) {
@@ -348,7 +387,8 @@ public final class AVPlayerEngine: PlaybackEngine {
         guard session.startTask == nil, let item = session.item else { return }
         session.startTask = Task { [weak self, weak session] in
             guard let self, let session else { return }
-            if session.startAt > 0 {
+            // (A session that starts at once is positioned by its item, which was told where to begin.)
+            if session.startAt > 0, !session.startsAtOnce {
                 let time = CMTime(seconds: self.clamped(session.startAt, in: item), preferredTimescale: 600)
                 var landed = false
                 for _ in 0..<Self.maxSeekAttempts where !landed {
@@ -372,9 +412,10 @@ public final class AVPlayerEngine: PlaybackEngine {
         request.attempts += 1
         session.seek = request
         let time = CMTime(seconds: clamped(request.target, in: session.item), preferredTimescale: 600)
-        // Zero tolerance: a keyframe-snapped seek lands a few seconds
-        // off the target and the picture jumps back after it.
-        player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self, weak session] finished in
+        // Zero tolerance by default: a keyframe-snapped seek lands a few seconds
+        // off the target and the picture jumps back after it. (`Options.jumps` can ask for the cheap landing.)
+        let tolerance: CMTime = options.jumps == .exact ? .zero : .positiveInfinity
+        player.seek(to: time, toleranceBefore: tolerance, toleranceAfter: tolerance) { [weak self, weak session] finished in
             Task { @MainActor in
                 // A newer seek replaced this one (its token is the one in `session.seek` now), or the
                 // session is gone: the newer one answers, and reporting this one would report a
