@@ -89,6 +89,39 @@ final class CoordinatorOnHLSPictureTests: XCTestCase {
         XCTAssertGreaterThan(probe.seen.first ?? 0, picture.frame(at: before) - 6, "from where it was, not from frame 0: \(probe.seen.prefix(4))")
     }
 
+    func testALoadAtAPositionThroughTheCoordinatorShowsNoFrameBeforeItWhenTheEngineTellsTheItemWhereToBegin() async throws {
+        var first: [Bool: [Int]] = [:]
+        for tells in [false, true] {
+            let (rig, _, probes) = try await rig(options: .init(tellsItemWhereToBegin: tells))
+            rig.coordinator.load(film, startAt: 20, quality: hi)
+            let playing = await rig.waitUntilPlayingPast(20.6)
+            XCTAssertTrue(playing, "option \(tells), phases: \(rig.phases), state: \(rig.state)")
+            XCTAssertEqual(rig.phases, [.loading, .playing], "option \(tells): a start at a position is a start, whoever tells the item")
+            let probe = try XCTUnwrap(probes.latest)
+            await rig.wait { probe.latest != nil }
+            first[tells] = probe.seen
+            await assertPictureAgreesWithClock(rig, probe, "option \(tells): and the picture goes on with the clock")
+        }
+        XCTAssertEqual(first[false]?.first, 0, "control: without the option the opening frame is shown first: \(first[false]?.prefix(4) ?? [])")
+        XCTAssertFalse(first[true]?.contains { $0 < picture.frame(at: 20) - 1 } == true, "no frame before the start position: \(first[true]?.prefix(4) ?? [])")
+    }
+
+    func testAReloadUnderTheViewerBeginsWhereItIsAskedToWhenTheEngineTellsTheItemWhereToBeginAndKeepsWhatTheViewerWanted() async throws {
+        let (rig, _, probes) = try await rig(options: .init(tellsItemWhereToBegin: true))
+        rig.coordinator.load(film, quality: hi)
+        let playing = await rig.waitUntilPlayingPast(1.0)
+        XCTAssertTrue(playing, "phases: \(rig.phases), state: \(rig.state)")
+        rig.coordinator.reload(startAt: 20, quality: hi)
+        let playsOn = await rig.waitUntilPlayingPast(20.6)
+        XCTAssertTrue(playsOn, "phases: \(rig.phases), state: \(rig.state)")
+        XCTAssertEqual(probes.all.count, 2, "the provider made a second item")
+        XCTAssertTrue(rig.state.wantsPlay, "what the viewer wanted stays")
+        let probe = try XCTUnwrap(probes.latest)
+        XCTAssertFalse(probe.seen.contains { $0 < picture.frame(at: 20) - 1 }, "the new stream shows nothing from before the place it was asked to begin at: \(probe.seen.prefix(4))")
+        XCTAssertFalse(rig.phases.contains(.buffering), "phases: \(rig.phases)")
+        await assertPictureAgreesWithClock(rig, probe, "and the picture goes on with the clock")
+    }
+
     func testACheapJumpIntoAPartThatIsNotLoadedLeavesTheStateAtTheTargetUntilTheNextTickAndThenAtWhereThePlayerIs() async throws {
         // This pins what is. `seekFinished` says that the jump landed, not where: the state keeps the target (15.6) until the next tick of the player,
         // which says 12.0 - the start of the segment the cheap jump landed at. Whoever shows `state.position` shows the bar jumping back by what the jump

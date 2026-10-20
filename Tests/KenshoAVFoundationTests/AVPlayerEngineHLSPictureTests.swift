@@ -247,11 +247,12 @@ final class AVPlayerEngineHLSPictureTests: XCTestCase {
     }
 
     func testStartingAtAPositionFetchesTheBeginningOfTheStreamFirstAndShowsItsOpeningFrameWhereAnItemToldWhereToBeginDoesNot() async throws {
-        // This pins what is, not what should be. The engine puts the item on the player, waits until it is ready and jumps; AVPlayer has started at 0
-        // by then, and fetches the first segments and shows the first frame before the jump arrives. An item that is told where to begin before it
-        // loads (what the car's way of starting does - the provider's `item.seek`) fetches nothing of the beginning and shows no frame before the position.
-        // Measured on 2026-10-19/20 on a stream of 60 s (video and audio segments 0 to 4 or 6 fetched first, then those from 16 on; frames [0, 792] against
-        // [792]); the cost on a source that makes its segments on request - PrismCore - is not measured.
+        // This pins what the engine does by default (`Options.tellsItemWhereToBegin` off). It puts the item on the player, waits until it is ready and jumps;
+        // AVPlayer has started at 0 by then, and fetches the first segments and shows the first frame before the jump arrives. An item that is told where to
+        // begin before it loads (what the car's way of starting does - the provider's `item.seek`) fetches nothing of the beginning and shows no frame before the
+        // position. Measured on 2026-10-19/20 on a stream of 60 s (video and audio segments 0 to 4 or 6 fetched first, then those from 16 on; frames [0, 792] against
+        // [792]); the cost on a source that makes its segments on request - PrismCore - is not measured. The option that has the engine do what the provider does
+        // here, and what it changes, is `testAnItemTheEngineToldWhereToBeginAsksForNoSegmentOfTheBeginning…`.
         var fetchedFirst: [Bool] = []
         var framesSeen: [[Int]] = []
         for told in [false, true] {
@@ -509,5 +510,217 @@ final class AVPlayerEngineHLSPictureTests: XCTestCase {
         let probe = try XCTUnwrap(probes.latest)
         XCTAssertLessThan(probe.seen.first ?? Int.max, picture.frame(at: 12.0) + 6, "the first picture is the segment's first frame: \(probe.seen.prefix(5))")
         XCTAssertEqual(h.stalls(of: Epoch(1)), 0)
+    }
+
+    // MARK: - The engine tells the item where to begin (`Options.tellsItemWhereToBegin`)
+
+    /// What a start at a position did, seen from the stream (the segments the server was asked for) and from the screen (the frames the probe was handed).
+    private struct Start: CustomStringConvertible {
+        var videoSegments: [Int]
+        var audioSegments: [Int]
+        /// The segments that hold the start position.
+        var holdingVideoSegment: Int
+        var holdingAudioSegment: Int
+        var frames: [Int]
+        /// Seconds from the `load` to `engineReady`, and where the player was when the engine said so.
+        var took: TimeInterval
+        var position: TimeInterval
+        var description: String {
+            "ready after \(String(format: "%.2f", took)) s at \(String(format: "%.3f", position)); picture segments \(videoSegments), audio segments \(audioSegments); frames \(frames.prefix(6))"
+        }
+    }
+
+    /// The numbers of the segments asked for under `directory` (`video`, `audio-en`), in the order they were asked for.
+    private func segmentsAsked(_ paths: [String], _ directory: String, variant: String = "hi") -> [Int] {
+        let prefix = "/\(variant)/\(directory)/seg"
+        return paths.compactMap { path in
+            guard path.hasPrefix(prefix), path.hasSuffix(".m4s") else { return nil }
+            return Int(path.dropFirst(prefix.count).dropLast(4))
+        }
+    }
+
+    /// One load at `position` on a stream of its own, paused, until the engine says ready - and 0.4 s longer, for what AVPlayer would ask for after that.
+    private func start(
+        at position: TimeInterval, seconds: TimeInterval = 60, segmentSeconds: TimeInterval = 2, options: AVPlayerEngine.Options
+    ) async throws -> Start {
+        let (h, hls, probes) = try await rig(seconds: seconds, segmentSeconds: segmentSeconds, options: options)
+        let began = ProcessInfo.processInfo.systemUptime
+        h.engine.perform(.load(Epoch(1), film, startAt: position, selection: none, quality: nil))
+        let ready = await h.waitFor(.engineReady(Epoch(1)), timeout: 20)
+        XCTAssertTrue(ready, "\(options): \(h.events)")
+        let took = ProcessInfo.processInfo.systemUptime - began
+        let positionWhenReady = h.player.currentTime().seconds
+        try await Task.sleep(nanoseconds: 400_000_000)
+        let probe = try XCTUnwrap(probes.latest)
+        probe.poll()
+        let paths = hls.server.requestedPaths
+        return Start(
+            videoSegments: segmentsAsked(paths, "video"), audioSegments: segmentsAsked(paths, "audio-en") + segmentsAsked(paths, "audio-de"),
+            holdingVideoSegment: hls.videoSegmentIndex(at: position), holdingAudioSegment: hls.segmentIndex(at: position),
+            frames: probe.seen, took: took, position: positionWhenReady
+        )
+    }
+
+    func testAnItemTheEngineToldWhereToBeginAsksForNoSegmentOfTheBeginningAndShowsNoFrameBeforeTheStartPosition() async throws {
+        // The same stream and start as `testStartingAtAPositionFetchesTheBeginningOfTheStreamFirst…`: 33 s of 60. Without the option that test's state is the
+        // control (the beginning is asked for and its first frame shown, then the jump); the other is the option.
+        let measuring = ProcessInfo.processInfo.environment["KENSHO_MEASURE"] != nil
+        var off: [Start] = [], on: [Start] = []
+        for _ in 0..<(measuring ? 5 : 1) {
+            off.append(try await start(at: 33, options: .init()))
+            on.append(try await start(at: 33, options: .init(tellsItemWhereToBegin: true)))
+        }
+        measured("start at 33 s of 60 s, option off: \(off.last!)")
+        measured("start at 33 s of 60 s, option on:  \(on.last!)")
+        measured("time to ready, \(off.count) starts each, off: \(off.map { String(format: "%.2f", $0.took) }), on: \(on.map { String(format: "%.2f", $0.took) })")
+
+        let control = off[0], told = on[0]
+        XCTAssertTrue(control.videoSegments.contains(0) && control.audioSegments.contains(0), "control: without the option the beginning of the stream is asked for: \(control)")
+        XCTAssertEqual(control.frames.first, 0, "control: and its first frame shown: \(control)")
+
+        XCTAssertTrue(told.videoSegments.allSatisfy { $0 >= told.holdingVideoSegment }, "nothing of the picture before the segment that holds 33 s (\(told.holdingVideoSegment)): \(told)")
+        XCTAssertTrue(told.audioSegments.allSatisfy { $0 >= told.holdingAudioSegment }, "nor of the audio before its segment (\(told.holdingAudioSegment)): \(told)")
+        XCTAssertEqual(told.videoSegments.first, told.holdingVideoSegment, "the first segment of the picture that is asked for is the one with the position: \(told)")
+        XCTAssertFalse(told.frames.contains { $0 < picture.frame(at: 33) - 1 }, "no frame before the start position - not the opening frame, not the keyframe's 768 before it: \(told)")
+        XCTAssertEqual(Double(told.frames.first ?? -1), Double(picture.frame(at: 33)), accuracy: 1, "the first picture is the frame of the start position: \(told)")
+        XCTAssertEqual(told.position, 33, accuracy: 0.05, "and the engine says ready only there")
+    }
+
+    func testAnItemTheEngineToldWhereToBeginIsReadyOnTheSecondOfTheStartPositionAndPlaysOnFromThereWithoutAStall() async throws {
+        // (`testAStartPositionIsReachedOnTheFrameAndNotAtTheKeyframeBefore` with the option: 13 s, the keyframe before it at 12.0.)
+        let (h, _, probes) = try await rig(options: .init(tellsItemWhereToBegin: true))
+        let ready = await load(h, startAt: 13)
+        XCTAssertTrue(ready, "events: \(h.events)")
+        let probe = try XCTUnwrap(probes.latest)
+        probe.poll()
+        XCTAssertEqual(h.player.currentTime().seconds, 13, accuracy: 0.05)
+        XCTAssertEqual(h.player.rate, 0, "the session starts paused")
+        XCTAssertTrue(probe.seen.contains { abs($0 - picture.frame(at: 13)) <= 1 }, "the picture of the start position is on the player when the engine says ready: \(probe.seen)")
+        // The told item is exact: the cheap landing would have shown the frame of the start of its segment (288), and the engine's start no frame 0.
+        XCTAssertFalse(probe.seen.contains { $0 < picture.frame(at: 13) - 1 }, "no frame before the start position: \(probe.seen)")
+        h.engine.perform(.play(Epoch(1)))
+        let playsOn = await h.wait { (h.lastTick(of: Epoch(1)) ?? 0) > 13.6 }
+        XCTAssertTrue(playsOn, "events: \(h.events.suffix(6))")
+        XCTAssertGreaterThan(h.ticks(of: Epoch(1)).first ?? 0, 12.9, "never from the start: \(h.ticks(of: Epoch(1)).prefix(3))")
+        XCTAssertEqual(h.stalls(of: Epoch(1)), 0, "events: \(withoutTicks(h.events))")
+        probe.poll()
+        XCTAssertEqual(Double(probe.latest ?? -1), Double(picture.frame(at: h.player.currentTime().seconds)), accuracy: 3, "and the picture goes on with the clock")
+    }
+
+    func testAStartPositionPastTheEndIsNoFailureWhenTheItemWasToldToGoThereAndTheEngineJumpsToTheEnd() async throws {
+        // `SeekTarget` cuts a target to what the item says is seekable; an item that is not loaded says nothing, so the position goes to it as it is. Measured:
+        // AVPlayer takes it to the start of the last segment (frame 672 = 28.0 s), and it is the jump after `readyToPlay` that brings the session to the end.
+        for position in [31.0, 5_000.0] {
+            let (h, _, probes) = try await rig(options: .init(tellsItemWhereToBegin: true))
+            h.engine.perform(.load(Epoch(1), film, startAt: position, selection: none, quality: nil))
+            let answered = await h.wait(timeout: 20) { h.events.contains(.engineReady(Epoch(1))) || h.events.contains { self.isFailure($0) } }
+            XCTAssertTrue(answered, "start \(position): \(h.events)")
+            XCTAssertTrue(h.events.contains(.engineReady(Epoch(1))), "start \(position): a position past the end is no failure: \(h.events)")
+            let duration = try XCTUnwrap(h.player.currentItem).duration.seconds
+            XCTAssertEqual(h.player.currentTime().seconds, duration, accuracy: 0.15, "start \(position): at the end, where the engine's own jump puts it")
+            measured("start \(position) in a stream of \(duration) s, told: ready at \(h.player.currentTime().seconds), frames \(probes.latest?.seen ?? [])")
+        }
+    }
+
+    func testAnItemTheEngineToldWhereToBeginWaitsForAPlaylistThatComesLateAndIsThenReadyAtTheEdgeOfTheStream() async throws {
+        // 30.0 s is where the picture ends (the audio goes on to 30.02). One start there stayed without an answer for ten seconds in about a hundred, with the
+        // item knowing only the duration of the picture; not reproduced since. A resource that comes late is no such thing: the item waits and is ready.
+        for held in ["the audio playlist", "the picture's playlist", "a segment of the picture"] {
+            let (h, hls, _) = try await rig(options: .init(tellsItemWhereToBegin: true))
+            let path: String
+            switch held {
+            case "the audio playlist": path = hls.playlistPath(audio: "en")
+            case "the picture's playlist": path = hls.videoPlaylistPath()
+            default: path = hls.videoSegmentPath(hls.videoSegmentIndex(at: 30))
+            }
+            hls.server.hold(path)
+            h.engine.perform(.load(Epoch(1), film, startAt: 30, selection: none, quality: nil))
+            try await Task.sleep(nanoseconds: 1_000_000_000)
+            XCTAssertFalse(h.events.contains(.engineReady(Epoch(1))), "\(held): it waits for what was kept back (else this test shows nothing)")
+            XCTAssertFalse(h.events.contains { isFailure($0) }, "\(held): and a wait is no failure: \(h.events)")
+            hls.server.release(path)
+            let ready = await h.waitFor(.engineReady(Epoch(1)), timeout: 20)
+            XCTAssertTrue(ready, "\(held): \(h.events)")
+            XCTAssertEqual(h.player.currentTime().seconds, 30, accuracy: 0.05, "\(held)")
+        }
+    }
+
+    func testTheItemThatTakesOverAtASwapIsToldWhereToBeginAndShowsNoFrameBeforeThePositionNorAsksForTheBeginningAgain() async throws {
+        struct Swap { var frames: [Int]; var asked: [String]; var position: TimeInterval; var at: TimeInterval }
+        var swaps: [Bool: Swap] = [:]
+        for tells in [false, true] {
+            let (h, hls, _) = try await rig(options: .init(tellsItemWhereToBegin: tells))
+            let ready = await load(h, startAt: 14)
+            XCTAssertTrue(ready, "option \(tells): \(h.events)")
+            h.engine.perform(.play(Epoch(1)))
+            await h.wait { (h.lastTick(of: Epoch(1)) ?? 0) > 14.6 }
+            h.engine.perform(.prepareSwap(Epoch(2), lo, startAt: 14.6, selection: none))
+            let prepared = await h.waitFor(.swapPrepared(Epoch(2)), timeout: 20)
+            XCTAssertTrue(prepared, "option \(tells): \(withoutTicks(h.events))")
+            let asking = hls.server.requestedPaths.count
+            let at = h.player.currentTime().seconds
+            h.engine.perform(.commitSwap(Epoch(2), replacing: Epoch(1), at: at, selection: none))
+            // (The copy is on the player when `perform` returns and has loaded nothing: its probe sees every picture it shows.)
+            let probe = PictureProbe(item: try XCTUnwrap(h.player.currentItem), watches: true)
+            let finished = await h.waitFor(.swapFinished(Epoch(2)), timeout: 20)
+            XCTAssertTrue(finished, "option \(tells): \(withoutTicks(h.events))")
+            try await Task.sleep(nanoseconds: 400_000_000)
+            probe.poll()
+            swaps[tells] = Swap(frames: probe.seen, asked: Array(hls.server.requestedPaths.dropFirst(asking)), position: h.player.currentTime().seconds, at: at)
+            measured("swap at \(at) s, option \(tells): frames \(probe.seen.prefix(6)); asked since the commit: picture \(segmentsAsked(swaps[tells]!.asked, "video", variant: "lo")), audio \(segmentsAsked(swaps[tells]!.asked, "audio-en", variant: "lo")); at \(swaps[tells]!.position)")
+        }
+        let control = try XCTUnwrap(swaps[false]), told = try XCTUnwrap(swaps[true])
+        XCTAssertEqual(control.frames.first, 0, "control: without the option the copy shows its opening frame first: \(control.frames.prefix(4))")
+        XCTAssertTrue(segmentsAsked(control.asked, "video", variant: "lo").contains(0), "control: and asks for the beginning of the picture again: \(control.asked)")
+        XCTAssertFalse(told.frames.contains { $0 < picture.frame(at: told.at) - 1 }, "no frame from before the position where the player was (\(told.at) s): \(told.frames.prefix(4))")
+        XCTAssertFalse(segmentsAsked(told.asked, "video", variant: "lo").contains(0), "no segment of the beginning of the picture: \(told.asked)")
+        XCTAssertFalse(segmentsAsked(told.asked, "audio-en", variant: "lo").contains(0), "nor of the audio: \(told.asked)")
+        XCTAssertEqual(told.position, told.at, accuracy: 0.05, "and the swap is finished where the player was")
+    }
+
+    func testAnEngineThatStartsAtOnceLeavesTheStartPositionToItsProviderWhateverTheOptionSays() async throws {
+        // The car's way (`testAPictureItemThatWasToldWhereToBeginWithThePlainSeek…`), with the option on: the item begins at the start of its segment (12.0), where
+        // the provider's plain seek put it. A seek of the engine with no tolerance would have replaced that one and begun at 15.6.
+        let (h, hls, probes) = try await rig(segmentSeconds: 6, options: .init(startsPlayingAtOnce: true, tellsItemWhereToBegin: true))
+        h.make = { [unowned hls] _, _ in
+            let item = AVPlayerItem(url: hls.masterURL("hi"))
+            item.seek(to: CMTime(seconds: 15.6, preferredTimescale: 600), completionHandler: nil)
+            probes.all.append(PictureProbe(item: item, watches: true))
+            return item
+        }
+        h.engine.perform(.load(Epoch(1), film, startAt: 15.6, selection: none, quality: nil))
+        let ready = await h.waitFor(.engineReady(Epoch(1)))
+        XCTAssertTrue(ready, "events: \(h.events)")
+        let moved = await h.wait { (h.lastTick(of: Epoch(1)) ?? 0) > 12.5 }
+        XCTAssertTrue(moved, "events: \(h.ticks(of: Epoch(1)).prefix(4))")
+        XCTAssertEqual(h.ticks(of: Epoch(1)).first ?? 0, hls.videoSegmentStart(2) + 0.3, accuracy: 0.5, "from the start of its segment, the provider's landing: \(h.ticks(of: Epoch(1)).prefix(4))")
+        let probe = try XCTUnwrap(probes.latest)
+        XCTAssertLessThan(probe.seen.first ?? Int.max, picture.frame(at: 12.0) + 6, "and its first frame: \(probe.seen.prefix(5))")
+    }
+
+    func testAnItemTheProviderToldWhereToBeginIsToldAgainByTheEngineWhoseExactSeekReplacesTheProvidersCheapOne() async throws {
+        // Segments of 6 s with a keyframe every two: the provider's plain seek to 15.6 lands at the start of the segment (12.0); the exact one at 15.6. An engine that
+        // does not start at once jumps exactly after `readyToPlay` in any case, so what the option changes is the picture on the way: the segment's first frame, or none.
+        var frames: [Bool: [Int]] = [:]
+        for tells in [false, true] {
+            let (h, hls, probes) = try await rig(segmentSeconds: 6, options: .init(tellsItemWhereToBegin: tells))
+            h.make = { [unowned hls] _, _ in
+                let item = AVPlayerItem(url: hls.masterURL("hi"))
+                item.seek(to: CMTime(seconds: 15.6, preferredTimescale: 600), completionHandler: nil)
+                probes.all.append(PictureProbe(item: item, watches: true))
+                return item
+            }
+            h.engine.perform(.load(Epoch(1), film, startAt: 15.6, selection: none, quality: nil))
+            let ready = await h.waitFor(.engineReady(Epoch(1)))
+            XCTAssertTrue(ready, "option \(tells): \(h.events)")
+            XCTAssertEqual(h.player.currentTime().seconds, 15.6, accuracy: 0.05, "option \(tells): ready on the second in both")
+            try await Task.sleep(nanoseconds: 300_000_000)
+            let probe = try XCTUnwrap(probes.latest)
+            probe.poll()
+            frames[tells] = probe.seen
+        }
+        measured("provider told 15.6 s (plain seek), engine not at once: option off \(frames[false] ?? []), on \(frames[true] ?? [])")
+        XCTAssertTrue(frames[false]?.contains { $0 < picture.frame(at: 15.6) - 12 } == true, "control: the provider's landing is shown first: \(frames[false] ?? [])")
+        XCTAssertFalse(frames[true]?.contains { $0 < picture.frame(at: 15.6) - 1 } == true, "the engine's exact seek replaced it: nothing before the position: \(frames[true] ?? [])")
     }
 }

@@ -73,10 +73,27 @@ public final class AVPlayerEngine: PlaybackEngine {
             /// where: the state machine keeps the target until the next tick of the player says otherwise.
             case cheapest
         }
+        /// The item is told where to begin before it is on the player: a session whose start position is more than zero gets
+        /// `AVPlayerItem.seek(to:toleranceBefore:toleranceAfter:)` with no tolerance before `replaceCurrentItem` - a load at a position, a `reload`, and the item
+        /// that takes over from another at the position the player was at. Without it the item begins at 0, and AVPlayer fetches the first segments of the
+        /// stream (picture and sound) and shows its first frame before the jump the engine makes when the item is ready arrives. Measured on an HLS stream of 60 s
+        /// with a start at 33 s (`AVPlayerEngineHLSPictureTests`, `Docs/Zusammenfuehrung.md`): without the option some of the segments 0 to 5 are asked for before the ones
+        /// from 16 on, and the frames seen are 0 and 792; with it the first segment asked for is 16 and the only frame is 792. A source that makes a segment when it is
+        /// asked for pays for each of those (PrismCore: not measured).
+        ///
+        /// What stays: the jump after `readyToPlay`, exact, and `engineReady` (`swapFinished`) only when it has landed. The position is not cut to what the item can
+        /// seek to (`SeekTarget`) - an item that is not loaded has no seekable ranges - so one past the end goes to AVPlayer as it is (it takes the item to the start of
+        /// its last segment), and the jump after `readyToPlay` puts the session at the end.
+        ///
+        /// A provider that tells the item itself (`item.seek` before it returns it) is told over: the engine's seek is the later one and replaces the provider's, with no
+        /// tolerance, and the item would be at the exact position after `readyToPlay` anyway. A session that `startsPlayingAtOnce` is never told: its start position is
+        /// the provider's. The time of the item is taken to be the time of the film, as the jump after `readyToPlay` takes it already.
+        public var tellsItemWhereToBegin: Bool
 
-        public init(startsPlayingAtOnce: Bool = false, jumps: Jumps = .exact) {
+        public init(startsPlayingAtOnce: Bool = false, jumps: Jumps = .exact, tellsItemWhereToBegin: Bool = false) {
             self.startsPlayingAtOnce = startsPlayingAtOnce
             self.jumps = jumps
+            self.tellsItemWhereToBegin = tellsItemWhereToBegin
         }
     }
 
@@ -357,6 +374,11 @@ public final class AVPlayerEngine: PlaybackEngine {
         let setsGoing = session.startsAtOnce && !session.held
         expectsPlaying = setsGoing
         player.pause()
+        if options.tellsItemWhereToBegin, !session.startsAtOnce, session.startAt.isFinite, session.startAt > 0 {
+            // (No completion handler: `start()` jumps again when the item is ready, and says so when it has landed. The position is not cut to the
+            // seekable ranges - an item that is not loaded has none; see `Options.tellsItemWhereToBegin`.)
+            item.seek(to: CMTime(seconds: session.startAt, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero, completionHandler: nil)
+        }
         player.replaceCurrentItem(with: item)
         if setsGoing { player.play() }
     }
