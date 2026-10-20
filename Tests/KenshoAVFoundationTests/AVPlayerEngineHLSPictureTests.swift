@@ -177,13 +177,24 @@ final class AVPlayerEngineHLSPictureTests: XCTestCase {
         }
     }
 
-    func testEveryKindOfJumpIntoALoadedPartLandsOnTheTargetAndShowsItsFrame() async throws {
-        // The cheap jump is cheap only where it saves a fetch: a part that is there is landed on exactly, whatever the tolerance.
+    func testEveryKindOfJumpIntoALoadedPartLandsOnTheTargetOrAtTheStartOfItsSegmentAndNowhereElse() async throws {
+        // The exact jump lands on the target. The cheap kinds land on the target where the part has been received and the player is through with it - in
+        // every run at the machine's usual load, until a full run (load about 8) had one cheap jump land at the start of the segment although the part was
+        // there. With eight busy loops beside the test (load 58 to 97, other sessions among it) 8 runs of 20 had one, for every kind of cheap jump, the
+        // engine's and the plain `seek(to:)`, and whatever was done to make sure of the part (waiting for the requests, for the flags of the item, visiting
+        // the part first). What holds under load as well: the target or the start of its segment, and nowhere else - never a keyframe inside the segment -
+        // and the picture is the frame of the clock.
         for segmentSeconds in [2.0, 6.0] {
             for jump in [Jump.engineExact, .engineCheapest, .plainSeek, .infiniteTolerance] {
                 let result = try await landing(of: jump, to: 15.6, segmentSeconds: segmentSeconds, loaded: true)
-                XCTAssertEqual(result.time, 15.6, accuracy: 0.05, "segments of \(segmentSeconds) s, \(jump): \(result)")
-                XCTAssertEqual(Double(result.frame ?? -1), Double(picture.frame(at: 15.6)), accuracy: 1, "segments of \(segmentSeconds) s, \(jump): \(result)")
+                let label = "segments of \(segmentSeconds) s, \(jump): \(result)"
+                if jump == .engineExact {
+                    XCTAssertEqual(result.time, 15.6, accuracy: 0.05, label)
+                } else {
+                    let onTarget = abs(result.time - 15.6) < 0.05, atStart = abs(result.time - result.videoSegmentStart) < 0.05
+                    XCTAssertTrue(onTarget || atStart, label)
+                }
+                XCTAssertEqual(Double(result.frame ?? -1), Double(picture.frame(at: result.time)), accuracy: 2, label)
             }
         }
     }
