@@ -143,6 +143,21 @@ final class HLSFixtureTests: XCTestCase {
         XCTAssertEqual(around.after ?? -1, 16, accuracy: 0.01)
     }
 
+    func testTheSoundOfTheStreamCanBeMadeAgainAndAgainWithoutTheWriterFailing() async throws {
+        // The encoder inside an `AVAssetWriter` in the HLS profile failed, or took the process down (SIGTRAP on the writer's queue in MediaToolbox), when the
+        // writer was used generation after generation: every one of eight processes died within 300 generations, after 5 to 90 of them, and a full test run met
+        // `-12780` once. The fixture muxes packets that were encoded outside the writer (`HLSStreamWriter.silentAAC`). A hundred and fifty generations in a
+        // row would have found the old way (measured, and shown again with the old code put back: see Docs/Zusammenfuehrung.md).
+        var durations: [[TimeInterval]] = []
+        for _ in 0..<150 {
+            let stream = try await HLSStreamWriter.silentAAC(seconds: 7, segmentSeconds: 2)
+            durations.append(stream.segments.map(\.duration))
+        }
+        XCTAssertEqual(Set(durations.map(\.count)), [4])
+        XCTAssertEqual(durations[0].reduce(0, +), 7.0589, accuracy: 0.001, "the length the encoder in the writer made, to the millisecond")
+        XCTAssertTrue(durations.allSatisfy { $0 == durations[0] }, "and the same every time")
+    }
+
     func testThePictureIsEncodedOncePerKindOfStreamAndNotOncePerTest() async throws {
         // The encoder is what a test with a picture pays for. (A length no other test uses, so that this one makes the first of its kind.)
         let before = HLSStreamWriter.pictureEncodings

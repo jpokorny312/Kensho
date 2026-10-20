@@ -8,7 +8,8 @@ import UniformTypeIdentifiers
 /// master playlist, alternate audio and subtitle renditions that are an `AVMediaSelectionGroup`, segments that come over HTTP one by one - and one
 /// that a test can keep back, so that the player runs dry in the middle of playing.
 ///
-/// Silent (a test run must not make a sound): fragmented MPEG-4 AAC segments written by `AVAssetWriter` in the HLS profile. By default the stream has no
+/// Silent (a test run must not make a sound): fragmented MPEG-4 AAC segments written by `AVAssetWriter` in the HLS profile (the AAC itself is encoded outside
+/// the writer: see `HLSStreamWriter.silentAAC`). By default the stream has no
 /// picture - that is no matter to the things the engine does (starting, jumping, stalling, choosing a track, swapping an item), and a picture makes
 /// every test cost the encoder. With a `Picture` the master has a video variant as well: H.264 in segments of its own, a keyframe at least every
 /// `keyframeSeconds`, black but for the number of the frame (`PictureCode`) - for what only a picture shows: where a jump lands (on a keyframe, at the
@@ -253,6 +254,28 @@ final class HLSFixture {
     }
 }
 
+/// A value made once for each key in a process and shared by everybody who asks - the encoders are what a test with a stream pays for, and a stream is only
+/// bytes. A failed attempt is not kept.
+final class MadeOnce<Key: Hashable & Sendable, Value: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var tasks: [Key: Task<Value, Error>] = [:]
+
+    func value(for key: Key, make: @escaping @Sendable () async throws -> Value) async throws -> Value {
+        let task: Task<Value, Error> = lock.withLock {
+            if let existing = tasks[key] { return existing }
+            let created = Task { try await make() }
+            tasks[key] = created
+            return created
+        }
+        do {
+            return try await task.value
+        } catch {
+            lock.withLock { tasks[key] = nil }
+            throw error
+        }
+    }
+}
+
 /// Writes silence, and a picture, as the segments of an HLS stream.
 enum HLSStreamWriter {
     struct Segment: Sendable {
@@ -294,35 +317,46 @@ enum HLSStreamWriter {
         }
     }
 
+    // MARK: - The sound
+
+    /// AAC packets of silence, as `AVAssetReader` hands them out: chunks of packets with the format description that the writer needs.
+    struct SilentPackets: @unchecked Sendable {
+        var format: CMFormatDescription
+        var samples: [CMSampleBuffer]
+    }
+
+    private static let packets = MadeOnce<TimeInterval, SilentPackets>()
+
+    /// Silence as the segments of an HLS stream.
+    ///
+    /// The AAC is **not** encoded by the writer. The encoder inside an `AVAssetWriter` in the HLS profile is the one part of this fixture that cannot be relied
+    /// on (macOS 27): used again and again, generation after generation, it fails (`AVFoundationErrorDomain -11800` with `-12780` or `-12706` underneath)
+    /// or takes the whole process down (SIGTRAP or SIGSEGV on the writer's queue in MediaToolbox, `fncHandleDeferredNotification`) - every one of eight
+    /// processes died within 300 generations in a row, after 5 to 90 of them, and three of six within 60 with 300 ms between them; keeping the writer alive
+    /// longer, appending the other documented way (`requestMediaDataWhenReady`) and waiting between the generations did not help. A full test
+    /// run of another session met it as `-12780`. The packets are therefore made by the encoder of `AVAudioFile` (the one `TestMedia` has always used), read back compressed, and
+    /// the writer only muxes them (`outputSettings: nil`): 3200 generations that way, eight processes at a time under load, without one failure. The segments
+    /// are the ones the encoder in the writer made, to the millisecond (30 s: 16 segments, 30.0698 s). The picture's H.264 encoder inside the writer
+    /// did not show it (600 generations, six processes at a time).
     static func silentAAC(seconds: TimeInterval, segmentSeconds: TimeInterval) async throws -> Stream {
-        let sampleRate = 44_100.0
+        let silence = try await packets.value(for: seconds) { try await encodePackets(seconds: seconds) }
         let collector = Collector()
         let writer = AVAssetWriter(contentType: .mpeg4Movie)
         writer.outputFileTypeProfile = .mpeg4AppleHLS
         writer.preferredOutputSegmentInterval = CMTime(seconds: segmentSeconds, preferredTimescale: 1)
         writer.initialSegmentStartTime = .zero
         writer.delegate = collector
-        let input = AVAssetWriterInput(mediaType: .audio, outputSettings: [
-            AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: sampleRate, AVNumberOfChannelsKey: 1, AVEncoderBitRateKey: 32_000,
-        ])
+        let input = AVAssetWriterInput(mediaType: .audio, outputSettings: nil, sourceFormatHint: silence.format)
         input.expectsMediaDataInRealTime = false
         writer.add(input)
         guard writer.startWriting() else { throw writer.error ?? CocoaError(.fileWriteUnknown) }
         writer.startSession(atSourceTime: .zero)
-
-        let total = Int64(seconds * sampleRate)
-        let chunk: Int64 = 4_096
-        var written: Int64 = 0
-        while written < total {
+        for sample in silence.samples {
             while !input.isReadyForMoreMediaData {
                 if writer.status == .failed { throw writer.error ?? CocoaError(.fileWriteUnknown) }
                 try await Task.sleep(nanoseconds: 1_000_000)
             }
-            let frames = min(chunk, total - written)
-            guard input.append(try silence(frames: Int(frames), from: written, sampleRate: sampleRate)) else {
-                throw writer.error ?? CocoaError(.fileWriteUnknown)
-            }
-            written += frames
+            guard input.append(sample) else { throw writer.error ?? CocoaError(.fileWriteUnknown) }
         }
         input.markAsFinished()
         await writer.finishWriting()
@@ -331,35 +365,45 @@ enum HLSStreamWriter {
         return stream
     }
 
+    /// `seconds` of silence written to a file by `AVAudioFile` and read back as the compressed packets it holds. The packets are copies in memory: they
+    /// are the same bytes after the file is gone.
+    private static func encodePackets(seconds: TimeInterval) async throws -> SilentPackets {
+        let directory = try TestMedia.makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = try TestMedia.silentAudio(seconds: seconds, in: directory, name: "silence")
+        let asset = AVURLAsset(url: url)
+        guard let track = try await asset.loadTracks(withMediaType: .audio).first else { throw CocoaError(.fileReadCorruptFile) }
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+        reader.add(output)
+        guard reader.startReading() else { throw reader.error ?? CocoaError(.fileReadCorruptFile) }
+        var samples: [CMSampleBuffer] = []
+        while let sample = output.copyNextSampleBuffer() { samples.append(sample) }
+        guard reader.status == .completed, let first = samples.first, let format = CMSampleBufferGetFormatDescription(first) else {
+            throw reader.error ?? CocoaError(.fileReadCorruptFile)
+        }
+        return SilentPackets(format: format, samples: samples)
+    }
+
     // MARK: - The picture
 
-    private static let pictureLock = NSLock()
-    nonisolated(unsafe) private static var pictures: [String: Task<Stream, Error>] = [:]
+    private static let pictures = MadeOnce<String, Stream>()
+    private static let encodingLock = NSLock()
     nonisolated(unsafe) private static var encoded = 0
     /// How often the encoder has run in this process (a test of the cache counts it).
-    static var pictureEncodings: Int { pictureLock.withLock { encoded } }
+    static var pictureEncodings: Int { encodingLock.withLock { encoded } }
 
     /// The picture stream, made once for each kind: the encoder is what a test with a picture pays for, and a stream is only bytes.
     static func cachedPicture(_ picture: HLSFixture.Picture, seconds: TimeInterval, segmentSeconds: TimeInterval) async throws -> Stream {
-        let key = "\(picture)-\(seconds)-\(segmentSeconds)"
-        let task: Task<Stream, Error> = pictureLock.withLock {
-            if let existing = pictures[key] { return existing }
-            let created = Task { try await self.picture(picture, seconds: seconds, segmentSeconds: segmentSeconds) }
-            pictures[key] = created
-            return created
-        }
-        do {
-            return try await task.value
-        } catch {
-            pictureLock.withLock { pictures[key] = nil }
-            throw error
+        try await pictures.value(for: "\(picture)-\(seconds)-\(segmentSeconds)") {
+            try await self.picture(picture, seconds: seconds, segmentSeconds: segmentSeconds)
         }
     }
 
     /// H.264 frames of the picture, cut into segments at keyframes. The keyframes are read back out of the segments: what the encoder was asked for is a
     /// maximum, and a test about where a jump lands must know where the keyframes are.
     static func picture(_ picture: HLSFixture.Picture, seconds: TimeInterval, segmentSeconds: TimeInterval) async throws -> Stream {
-        pictureLock.withLock { encoded += 1 }
+        encodingLock.withLock { encoded += 1 }
         let collector = Collector()
         let writer = AVAssetWriter(contentType: .mpeg4Movie)
         writer.outputFileTypeProfile = .mpeg4AppleHLS
@@ -411,30 +455,5 @@ enum HLSStreamWriter {
             stream.segments[index].keyframes = samples.filter(\.isSync).map(\.time)
         }
         return stream
-    }
-
-    /// 16-bit mono PCM of zeros; the writer's AAC encoder turns it into the packets of a segment.
-    private static func silence(frames: Int, from start: Int64, sampleRate: Double) throws -> CMSampleBuffer {
-        var description = AudioStreamBasicDescription(
-            mSampleRate: sampleRate, mFormatID: kAudioFormatLinearPCM, mFormatFlags: kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
-            mBytesPerPacket: 2, mFramesPerPacket: 1, mBytesPerFrame: 2, mChannelsPerFrame: 1, mBitsPerChannel: 16, mReserved: 0
-        )
-        var format: CMAudioFormatDescription?
-        guard CMAudioFormatDescriptionCreate(
-            allocator: nil, asbd: &description, layoutSize: 0, layout: nil, magicCookieSize: 0, magicCookie: nil, extensions: nil, formatDescriptionOut: &format
-        ) == noErr, let format else { throw CocoaError(.coderInvalidValue) }
-        let bytes = frames * 2
-        var block: CMBlockBuffer?
-        guard CMBlockBufferCreateWithMemoryBlock(
-            allocator: nil, memoryBlock: nil, blockLength: bytes, blockAllocator: nil, customBlockSource: nil,
-            offsetToData: 0, dataLength: bytes, flags: kCMBlockBufferAssureMemoryNowFlag, blockBufferOut: &block
-        ) == noErr, let block else { throw CocoaError(.coderInvalidValue) }
-        guard CMBlockBufferFillDataBytes(with: 0, blockBuffer: block, offsetIntoDestination: 0, dataLength: bytes) == noErr else { throw CocoaError(.coderInvalidValue) }
-        var buffer: CMSampleBuffer?
-        guard CMAudioSampleBufferCreateReadyWithPacketDescriptions(
-            allocator: nil, dataBuffer: block, formatDescription: format, sampleCount: frames,
-            presentationTimeStamp: CMTime(value: start, timescale: CMTimeScale(sampleRate)), packetDescriptions: nil, sampleBufferOut: &buffer
-        ) == noErr, let buffer else { throw CocoaError(.coderInvalidValue) }
-        return buffer
     }
 }

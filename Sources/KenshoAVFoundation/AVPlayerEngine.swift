@@ -67,7 +67,7 @@ public final class AVPlayerEngine: PlaybackEngine {
             /// To the position asked for (the default; what a start position and a skip of a segment need).
             case exact
             /// Where AVPlayer lands most cheaply, without the cost of decoding up to the exact position. Measured on HLS streams, with a picture that has a
-            /// keyframe every two seconds (`AVPlayerEngineHLSPictureTests`): on the target where the part it is in has been loaded already, at the **start of
+            /// keyframe every two seconds (`AVPlayerEngineHLSPictureTests`): on the target where the part it is in has been loaded already (not always, under load), at the **start of
             /// its segment** where it has not - not at a keyframe inside the segment (15.6 s lands at 12.005 s in segments of 6 s that have keyframes at 14.0
             /// and 16.0) - and no different from the plain `seek(to:)` that the old engine of the car used. `seekFinished` says that the jump landed, not
             /// where: the state machine keeps the target until the next tick of the player says otherwise.
