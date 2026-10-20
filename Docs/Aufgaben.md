@@ -2,7 +2,9 @@
 
 Stand 2026-10-19. Jede Aufgabe steht für sich und lässt sich ohne die anderen beginnen; was geprüft ist und was nicht, steht dabei. Die Reihenfolge der Liste in `CLAUDE.md` bleibt die Reihenfolge der Wichtigkeit; diese Seite sagt, **wie** man in die Aufgaben hineinkommt.
 
-## A. PrismCore: Bitmap-Untertitel (PGS / DVB / DVD) ohne OCR — Schritt 6
+## A. PrismCore: Bitmap-Untertitel (PGS / DVB / DVD) ohne OCR — Schritt 6 — **gebaut (2026-10-19), in `sync-upstream` zusammengeführt (2026-10-20, lokal, nicht gepusht); in Ensō offen**
+
+**Stand 2026-10-20.** Gebaut von einer Seitensitzung: PrismCore-Commit `84ac1b8` (`BitmapCue`, `setBitmapCueHandler(_:)`, `setBitmapCueStreams(_:replayingFrom:)`; ein Cue je Rechteck, `end` nie `nil`, der DVB-Zeitablauf ist eine Obergrenze; die Engine behält keine Historie, `replayingFrom:` liest neu), zusammen mit der Aufgabe B in `sync-upstream` (lokal, `e67f647`; 768 Tests grün, iOS und tvOS bauen). Gezeigt an handgebauten Paketen am echten Decoder, nicht an echtem Material und auf keinem Gerät; ein Fehler gefunden (`avcodec_flush_buffers` setzt den PGS-Decoder nicht zurück). **Offen in Ensō:** Pin (nach dem Push des Forks), Overlay (`BitmapCueRelay`), Umschaltung auf den OCR-Text bei externem Display. Die Übergabenotiz der Sitzung (`prismcore-bitmap-cues-fuer-enso.md`) hat die vier Stellen für den Pin-Wechsel.
 
 **Warum.** Bitmap-Untertitel gehen heute nur über Texterkennung auf dem Gerät (`SubtitleOCR`) und werden zu Text. Das verliert Schrift, Farbe, Platz auf dem Bild und das Forced-Flag (Übersetzung nur der fremdsprachigen Stellen), und Texterkennung irrt. Der Wunsch: das Bild selbst an die App geben, die es über das Video legt, im Takt von `AVPlayer`; bei einem externen Display bleibt der OCR-Text das Mittel, **ohne** dass der Nutzer umschaltet. Bild-in-Bild braucht keine Untertitel.
 
@@ -23,7 +25,9 @@ Stand 2026-10-19. Jede Aufgabe steht für sich und lässt sich ohne die anderen 
 
 **Danach, in Ensō (nicht Teil dieser Aufgabe):** PrismCore-Pin anheben (vier Stellen zusammen: `project.pbxproj`, `Package.resolved`, `Kensho/Package.swift`, `Documentation/OpenSource.md`; `Scripts/check_prismcore_pin.py` prüft), dann ein Overlay in der Ansicht (iPhone und Apple TV), das auf `AVPlayer.currentTime()` taktet und bei externem Display (`player.isExternalPlaybackActive` / HDMI-Ausgabe) auf den OCR-Text zurückfällt.
 
-## B. PrismCore: ein Strom der angeforderten Segmente und der Bandbreite — Schritt 7
+## B. PrismCore: ein Strom der angeforderten Segmente und der Bandbreite — Schritt 7 — **gebaut (2026-10-19), in `sync-upstream` zusammengeführt (2026-10-20, lokal, nicht gepusht); in Ensō offen**
+
+**Stand 2026-10-20.** Gebaut von einer Seitensitzung: PrismCore-Commit `073ef87` (`playbackEvents(delivery: true)`: `.segmentServed(path:index:bytes:waited:transferred:)` — von der Loopback-Verbindung angenommen, nicht vom Player gelesen — und `.sourceThroughput(bytesPerSecond:bytes:readTime:)`; Opt-in, `playbackEvents()` unverändert; `prismcore-cli serve --delivery`), mit der Aufgabe A in `sync-upstream` zusammengeführt (lokal; 768 Tests grün). Gegen eine gedrosselte HTTP-Quelle mit einem echten `AVPlayer` auf macOS gemessen; kein Gerät, kein iOS/tvOS-Lauf, kein echtes Netz. **Offen in Ensō:** Pin, und was der `AdaptiveStreamGovernor` damit macht (er liest den Zugriffslog des Server-Transcodes, nicht den einer PrismCore-Sitzung; nicht Teil der Aufgabe). Übergabenotiz: `prismcore-segment-events-fuer-enso.md`.
 
 **Warum.** Ensō liest bisher den **Zugriffslog von AVPlayer** (`AVPlayerItemAccessLog`; `AdaptiveStreamGovernor`, `AdaptiveStreamSession`, `PlayerView`, `PlayerItemLogDump`), um zu wissen, welches Segment welcher Qualität gerade gelesen wird und wie schnell. Der Log führt ein Ereignis je gelesener Playlist (Video, Ton, Untertitel); gilt die Bitrate des **größten** Ereignisses, nicht des letzten (siehe „Gelernte Fallen“ in `CLAUDE.md`). Das ist geraten, wo PrismCore es weiß: es *liefert* die Segmente.
 
