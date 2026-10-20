@@ -222,6 +222,10 @@ final class AVPlayerEngineHLSPictureTests: XCTestCase {
         let (h, _, probes) = try await rig()
         let ready = await load(h, startAt: 13)      // the keyframe is at 12.0
         XCTAssertTrue(ready, "events: \(h.events)")
+        // (The probe looks every ten milliseconds from the main run loop; one full run in a busy machine failed here - load average 10, the test passed alone three
+        // times and in the next full run - with the frame not yet in `seen`, probably because the timer had not come round yet. Looking now asks what the player has
+        // ready now, which is what "on the player when the engine said ready" means; a frame that is not there is still a failure.)
+        probes.latest?.poll()
         measured("start at 13 s: when the engine said ready the probe had seen \(probes.latest?.seen ?? [])")
         XCTAssertTrue(
             probes.latest?.seen.contains { abs($0 - picture.frame(at: 13)) <= 1 } == true,
