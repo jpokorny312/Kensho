@@ -66,8 +66,11 @@ public final class AVPlayerEngine: PlaybackEngine {
         public enum Jumps: Equatable, Sendable {
             /// To the position asked for (the default; what a start position and a skip of a segment need).
             case exact
-            /// Where AVPlayer lands most cheaply: at a keyframe or a segment start of a stream that is made of segments, without the cost of decoding up to
-            /// the exact position.
+            /// Where AVPlayer lands most cheaply, without the cost of decoding up to the exact position. Measured on HLS streams, with a picture that has a
+            /// keyframe every two seconds (`AVPlayerEngineHLSPictureTests`): on the target where the part it is in has been loaded already, at the **start of
+            /// its segment** where it has not - not at a keyframe inside the segment (15.6 s lands at 12.005 s in segments of 6 s that have keyframes at 14.0
+            /// and 16.0) - and no different from the plain `seek(to:)` that the old engine of the car used. `seekFinished` says that the jump landed, not
+            /// where: the state machine keeps the target until the next tick of the player says otherwise.
             case cheapest
         }
 
@@ -116,6 +119,8 @@ public final class AVPlayerEngine: PlaybackEngine {
         var item: AVPlayerItem?
         var startAt: TimeInterval = 0
         var selection = TrackSelection()
+        /// The choice the applier carried out last (nil: none yet). The next one is judged against it: "no subtitle" after a subtitle is the viewer's "off".
+        var applied: TrackSelection?
         var seek: SeekRequest?
         var hasFailed = false
         var statusObservation: NSKeyValueObservation?
@@ -140,7 +145,8 @@ public final class AVPlayerEngine: PlaybackEngine {
     }
 
     private let provider: ItemProvider
-    private let applier: SelectionApplier
+    /// What applies a choice to an item: the app's own applier, or the default, which also wants to know what was applied before (see `applyDefault`).
+    private let applier: @MainActor (AVPlayerItem, TrackSelection, _ previous: TrackSelection?) async -> Void
     private let options: Options
     private let log: KenshoLog
     /// The session whose item is on `player`.
@@ -178,7 +184,11 @@ public final class AVPlayerEngine: PlaybackEngine {
     ) {
         self.player = player
         self.provider = provider
-        self.applier = applier ?? AVPlayerEngine.defaultApplier
+        if let applier {
+            self.applier = { item, selection, _ in await applier(item, selection) }
+        } else {
+            self.applier = { item, selection, previous in await AVPlayerEngine.applyDefault(item, selection, after: previous) }
+        }
         self.options = options
         self.log = log
         observePlayer()
@@ -234,7 +244,8 @@ public final class AVPlayerEngine: PlaybackEngine {
             // loads - and cannot go any further: AVFoundation refuses an item that has been on one
             // player on another (NSInvalidArgumentException, even after it was taken off the first,
             // and an exception through Swift's async frames ends the process). A copy has the same
-            // asset, so what was loaded is not loaded again, and the same settings.
+            // asset - the master playlist is not asked for again; the media is, measured on an HLS
+            // stream (AVPlayerEngineHLSTests) - and the same settings, the choice of tracks among them.
             session.statusObservation = nil
             staging.replaceCurrentItem(with: nil)
             let item = (prepared.copy() as? AVPlayerItem) ?? AVPlayerItem(asset: prepared.asset)
@@ -277,7 +288,12 @@ public final class AVPlayerEngine: PlaybackEngine {
             session.selectionTask = Task { [weak self, weak session] in
                 await previous?.value
                 guard !Task.isCancelled, let self, let session, session === self.live else { return }
-                await self.applier(item, selection)
+                // Another audio rendition makes AVPlayer drop what it had and wait for the other; the wait that follows is the viewer's choice, not a stream
+                // that ran dry (and a quality policy that took it for one would step down for nothing).
+                self.stallWatch.trackChanged(now: ProcessInfo.processInfo.systemUptime)
+                await self.applier(item, selection, session.applied)
+                session.applied = selection
+                self.stallWatch.trackChanged(now: ProcessInfo.processInfo.systemUptime)
             }
 
         case .stop:
@@ -400,7 +416,8 @@ public final class AVPlayerEngine: PlaybackEngine {
                     return
                 }
             }
-            await self.applier(item, session.selection)
+            await self.applier(item, session.selection, session.applied)
+            session.applied = session.selection
             guard !Task.isCancelled, session === self.live else { return }
             session.stage = .running
             self.onEvent?(session.atPosition(session.epoch))
@@ -559,10 +576,15 @@ public final class AVPlayerEngine: PlaybackEngine {
     /// - Audio: a number selects that option; a number the stream has no option for changes nothing (what the viewer had stays); `nil` is "no
     ///   choice" and hands the group back to AVFoundation - an explicit choice stays in force until that is said (AVPlayerItem.h,
     ///   `selectMediaOptionAutomatically(in:)`), so without it the state machine says "default" while the player plays the track the viewer chose.
-    /// - Subtitles: a number selects that option (an out-of-range one changes nothing - it used to turn the subtitles off); `nil` is "off", said only
-    ///   when something is on and the group can be empty (AVMediaSelectionGroup.allowsEmptySelection), so that a plain start does not make "off"
-    ///   an explicit choice that keeps AVFoundation from showing forced subtitles.
-    static let defaultApplier: SelectionApplier = { item, selection in
+    /// - Subtitles: a number selects that option (an out-of-range one changes nothing - it used to turn the subtitles off). `nil` is "off", and "off" said
+    ///   to the group is a choice of its own: from then on AVFoundation no longer shows the forced subtitles it picks by itself (the lines of a film in a
+    ///   language the viewer does not understand, in the language of the audio) nor lets them follow a change of the audio. So it is said only where it has
+    ///   something to turn off - when a subtitle that is not a forced one is on (a plain start has none, and AVFoundation may have put one on because of
+    ///   the machine's settings), and when the viewer is turning off one he chose (`after` had a subtitle), a forced one included.
+    static let defaultApplier: SelectionApplier = { item, selection in await applyDefault(item, selection, after: nil) }
+
+    /// - Parameter previous: the choice applied before this one in the session, if any.
+    static func applyDefault(_ item: AVPlayerItem, _ selection: TrackSelection, after previous: TrackSelection?) async {
         let asset = item.asset
         if let group = try? await asset.loadMediaSelectionGroup(for: .audible) {
             if let index = selection.audio {
@@ -574,7 +596,8 @@ public final class AVPlayerEngine: PlaybackEngine {
         if let group = try? await asset.loadMediaSelectionGroup(for: .legible) {
             if let index = selection.subtitle {
                 if group.options.indices.contains(index) { item.select(group.options[index], in: group) }
-            } else if group.allowsEmptySelection, item.currentMediaSelection.selectedMediaOption(in: group) != nil {
+            } else if group.allowsEmptySelection, let on = item.currentMediaSelection.selectedMediaOption(in: group),
+                      previous?.subtitle != nil || !on.hasMediaCharacteristic(.containsOnlyForcedSubtitles) {
                 item.select(nil, in: group)
             }
         }

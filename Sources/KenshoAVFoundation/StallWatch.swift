@@ -14,7 +14,7 @@ import Kensho
 /// Waiting that follows `paused` is a start, a stall only if it lasts
 /// (`resumeGrace`, the same three seconds as in Enso's detector: a start that
 /// never gets going is as much a thing to act on as one that broke off).
-/// Waiting during a seek is the seek.
+/// Waiting during a seek is the seek, and so is the wait that follows the engine's own change of the track the player plays (`trackChanged`).
 struct StallWatch {
     enum Report: Equatable {
         case stalled
@@ -24,9 +24,16 @@ struct StallWatch {
     /// How long a wait that began at a start may last before it counts as a stall.
     static let resumeGrace: TimeInterval = 3
 
+    /// How long after the engine changed the track a `playing` -> waiting counts as the change. Measured on an HLS stream with alternate audio renditions
+    /// (`AVPlayerEngineHLSTests`): the wait began 40 to 50 ms after `AVPlayerItem.select(_:in:)`. A second is room for a busy main actor and too little to
+    /// hide a stall that has nothing to do with the change.
+    static let trackChangeWindow: TimeInterval = 1
+
     private var previous: AVPlayer.TimeControlStatus = .paused
     /// When the wait of a start began, while it goes on.
     private var startWaitBegan: TimeInterval?
+    /// When the engine last changed the track the player plays.
+    private var trackChangedAt: TimeInterval?
 
     /// - Parameters:
     ///   - seekInFlight: a seek the engine started has not landed yet.
@@ -39,6 +46,12 @@ struct StallWatch {
             return .recovered
         case .waitingToPlayAtSpecifiedRate:
             if previous == .playing && !seekInFlight {
+                if let changed = trackChangedAt, now - changed < Self.trackChangeWindow {
+                    // Another audio rendition is not an edit of the one that plays: AVPlayer drops what it had and waits for the other, with the very
+                    // reason of a stream that ran dry (`toMinimizeStalls`). The wait is the viewer's choice and counts like a start - a stall if it lasts.
+                    startWaitBegan = now
+                    return nil
+                }
                 startWaitBegan = nil
                 return .stalled
             }
@@ -51,6 +64,12 @@ struct StallWatch {
         @unknown default:
             return nil
         }
+    }
+
+    /// The engine changed the track the player plays (the viewer's audio or subtitle choice, applied to the item). The wait that follows is the change
+    /// and not a stream running dry; the engine says so before it applies the choice and when it is applied, so that the window covers a slow applier too.
+    mutating func trackChanged(now: TimeInterval) {
+        trackChangedAt = now
     }
 
     /// A seek the engine started has landed. If the player still waits, that wait is a start from here on - the jump is done, the picture has not come -

@@ -124,4 +124,45 @@ final class StallWatchTests: XCTestCase {
         watch.seekLanded(now: 14)
         XCTAssertEqual(watch.graceIsOver(now: 17, seekInFlight: false), .stalled, "counted from the landing")
     }
+
+    // MARK: - A wait that the engine's own change of the track causes
+
+    func testTheWaitRightAfterATrackChangeIsAStartFromThenAndNotAStall() {
+        var watch = StallWatch()
+        _ = watch.observe(.playing, seekInFlight: false, now: 0)
+        watch.trackChanged(now: 5)
+        // AVPlayer drops what it had of the old audio and waits for the new one: the choice of the viewer, not a weak link.
+        XCTAssertNil(watch.observe(.waitingToPlayAtSpecifiedRate, seekInFlight: false, now: 5.05))
+        XCTAssertEqual(watch.graceRemaining(now: 5.05), 3, "it counts like a start")
+        XCTAssertEqual(watch.observe(.playing, seekInFlight: false, now: 5.1), .recovered)
+        XCTAssertNil(watch.graceRemaining(now: 5.1), "and the new track plays")
+    }
+
+    func testAWaitOfATrackChangeThatLastsTheGraceIsAStallAfterAll() {
+        var watch = StallWatch()
+        _ = watch.observe(.playing, seekInFlight: false, now: 0)
+        watch.trackChanged(now: 5)
+        _ = watch.observe(.waitingToPlayAtSpecifiedRate, seekInFlight: false, now: 5.05)
+        XCTAssertNil(watch.graceIsOver(now: 8.04, seekInFlight: false))
+        XCTAssertEqual(watch.graceIsOver(now: 8.05, seekInFlight: false), .stalled, "the other track does not come: that is as much a thing to act on as a start that does not")
+    }
+
+    func testRunningDryLongAfterATrackChangeIsAStallRightAway() {
+        var watch = StallWatch()
+        _ = watch.observe(.playing, seekInFlight: false, now: 0)
+        watch.trackChanged(now: 5)
+        XCTAssertEqual(
+            watch.observe(.waitingToPlayAtSpecifiedRate, seekInFlight: false, now: 5 + StallWatch.trackChangeWindow + 0.1), .stalled,
+            "the change has nothing to do with this one"
+        )
+    }
+
+    func testATrackChangeOnAPlayerThatAlreadyStalledAddsNoSecondReport() {
+        var watch = StallWatch()
+        _ = watch.observe(.playing, seekInFlight: false, now: 0)
+        XCTAssertEqual(watch.observe(.waitingToPlayAtSpecifiedRate, seekInFlight: false, now: 1), .stalled)
+        watch.trackChanged(now: 2)
+        XCTAssertNil(watch.graceRemaining(now: 2))
+        XCTAssertNil(watch.graceIsOver(now: 9, seekInFlight: false))
+    }
 }
