@@ -31,6 +31,7 @@ final class LoopbackHTTPServer: @unchecked Sendable {
     private var resources: [String: Resource] = [:]
     private var held: Set<String> = []
     private var failing: [String: Int] = [:]
+    private var delays: [(prefix: String, seconds: TimeInterval)] = []
     private var parked: [Parked] = []
     private var log: [Request] = []
     private var answered: [Request] = []
@@ -100,6 +101,15 @@ final class LoopbackHTTPServer: @unchecked Sendable {
     /// From now on `path` is answered with this status (and no body worth the name) instead of its resource: a segment that is gone, a server that broke.
     func fail(_ path: String, status: Int = 404) {
         queue.sync { failing[path] = status }
+    }
+
+    /// From now on every request for a path that starts with `prefix` is answered `seconds` after it was read: a server that is far away, or has to start
+    /// something before it can answer. (0 takes it off again. The answer still comes in order for requests that are not held.)
+    func delay(prefix: String, by seconds: TimeInterval) {
+        queue.sync {
+            delays.removeAll { $0.prefix == prefix }
+            if seconds > 0 { delays.append((prefix, seconds)) }
+        }
     }
 
     /// From now on a request for `path` is read and kept open until `release(_:)`.
@@ -190,6 +200,12 @@ final class LoopbackHTTPServer: @unchecked Sendable {
         }
         if held.contains(path) {
             parked.append(Parked(connection: connection, request: request, isHead: isHead))
+        } else if let wait = delays.first(where: { path.hasPrefix($0.prefix) })?.seconds {
+            queue.asyncAfter(deadline: .now() + wait) { [weak self] in
+                // (A client that gave up in the meantime has taken its connection away.)
+                guard let self, self.connections[ObjectIdentifier(connection)] != nil else { return }
+                self.respond(to: connection, request: request, isHead: isHead)
+            }
         } else {
             respond(to: connection, request: request, isHead: isHead)
         }

@@ -12,6 +12,11 @@ import Kensho
 /// replacement's item to `readyToPlay` on a second, silent player while
 /// `player` plays on, and only `commitSwap` puts it on `player`.
 ///
+/// With `Options.prebuffer` the second player is more than a proof that the stream loads: it loads the stream ahead of the running player, jumps to
+/// where the running one will be, and **becomes `player`** (`onPlayerChange`) at the moment the old one reaches that place - one stops where the other
+/// begins, with nothing to fetch and nothing to decode in between (`PrebufferedPlayer`). Without it the replacement is a copy of the prepared item on the
+/// running player, which asks for the media again and waits to minimize stalls: the picture stands for the seconds that takes.
+///
 /// What the engine reports as a stall is playback that was running and ran
 /// dry (see `StallWatch`), not the wait for the first data after `play()`, a
 /// seek or a swap: AVPlayer shows `waitingToPlayAtSpecifiedRate` for every one
@@ -20,7 +25,18 @@ import Kensho
 @MainActor
 public final class AVPlayerEngine: PlaybackEngine {
     public var onEvent: ((PlaybackEvent) -> Void)?
-    public let player: AVPlayer
+    /// The player that plays. It is the one the engine was made with until a prebuffered replacement takes over (`Options.prebuffer`): then it is
+    /// the replacement's, and `onPlayerChange` says so.
+    public private(set) var player: AVPlayer
+    /// A prebuffered replacement took over: `new` is `player` now, `old` is let go of a moment after this returns. Whoever shows the picture, or holds the
+    /// player for anything else (picture in picture, the lock screen, a time observer of its own), follows here - in the same turn, so that the layer
+    /// shows the new player's picture when the old one's has ended. **Without a handler the engine makes no prebuffered hand-off** (the owner would go on
+    /// looking at a player that has stopped): a replacement is then a copy on the running player, as without the option.
+    public var onPlayerChange: ((_ new: AVPlayer, _ old: AVPlayer) -> Void)?
+    /// A layer the replacement's player is shown on while it waits (`Options.Prebuffer.waitsForFirstFrame`): a player that has no layer decodes no
+    /// picture, and the first frame after the hand-off would be a decoder starting. Whoever owns a view puts the layer in it, anywhere (a point in the
+    /// corner will do) and *under* the layer of the picture; the engine puts the replacement's player on it and takes it off again.
+    public let stagingLayer = AVPlayerLayer()
 
     /// What the provider is asked for: a source at a quality, wanted at a position and with these tracks. A stream that can begin where it is
     /// wanted need not begin at the start and be jumped; a server's transcode has the tracks in its address.
@@ -91,10 +107,37 @@ public final class AVPlayerEngine: PlaybackEngine {
         /// the provider's. The time of the item is taken to be the time of the film, as the jump after `readyToPlay` takes it already.
         public var tellsItemWhereToBegin: Bool
 
-        public init(startsPlayingAtOnce: Bool = false, jumps: Jumps = .exact, tellsItemWhereToBegin: Bool = false) {
+        /// A replacement (a quality change) is made ready on a player of its own, loaded ahead of the running one, and takes over *as the player*, at the
+        /// moment the running one reaches the place it waits at - the picture does not stand (measured on an HLS stream with a picture, a replacement that
+        /// answers 0.6 s late: 2.7 s of standing picture with the copy, 0.05 s - one frame - with this). nil: the replacement is a copy of the prepared item on
+        /// the running player. It needs an owner that follows `onPlayerChange`, no external playback (AirPlay, the car: their route is the running player's)
+        /// and a running player that plays; in any other case the engine does what it does without the option.
+        public var prebuffer: Prebuffer?
+
+        public struct Prebuffer: Equatable, Sendable {
+            /// Seconds that must be loaded from the place the replacement waits at before it is ready (and the reducer is told so).
+            public var bufferSeconds: TimeInterval
+            /// How far ahead of the running player the replacement waits: it is ready for the place where the running player will be when the hand-off
+            /// comes, which is a little ahead of where it is when the replacement is asked for. Less when the running player has little buffered.
+            public var lead: TimeInterval
+            /// A replacement that is not ready after this long is given up (`swapFailed`: the running player goes on).
+            public var timeout: TimeInterval
+            /// Wait for the first picture to be ready for display on `stagingLayer` (put in a view by the owner) before the replacement counts as ready.
+            public var waitsForFirstFrame: Bool
+
+            public init(bufferSeconds: TimeInterval = 6, lead: TimeInterval = 3, timeout: TimeInterval = 40, waitsForFirstFrame: Bool = false) {
+                self.bufferSeconds = bufferSeconds
+                self.lead = lead
+                self.timeout = timeout
+                self.waitsForFirstFrame = waitsForFirstFrame
+            }
+        }
+
+        public init(startsPlayingAtOnce: Bool = false, jumps: Jumps = .exact, tellsItemWhereToBegin: Bool = false, prebuffer: Prebuffer? = nil) {
             self.startsPlayingAtOnce = startsPlayingAtOnce
             self.jumps = jumps
             self.tellsItemWhereToBegin = tellsItemWhereToBegin
+            self.prebuffer = prebuffer
         }
     }
 
@@ -112,6 +155,8 @@ public final class AVPlayerEngine: PlaybackEngine {
             case loading
             /// A replacement is ready and waits for `commitSwap`.
             case prepared
+            /// A prebuffered replacement has been told to take over: the running player plays on until the moment of the hand-off.
+            case handingOff
             /// On `player`, getting to its start position.
             case starting
             case running
@@ -146,16 +191,21 @@ public final class AVPlayerEngine: PlaybackEngine {
         var resolveTask: Task<Void, Never>?
         var startTask: Task<Void, Never>?
         var selectionTask: Task<Void, Never>?
+        /// The replacement's own player, with its item loaded ahead of the running one (`Options.prebuffer`).
+        var prebuffered: PrebufferedPlayer?
+        var prebufferTask: Task<Void, Never>?
 
         init(epoch: Epoch, atPosition: @escaping (Epoch) -> PlaybackEvent) {
             self.epoch = epoch
             self.atPosition = atPosition
         }
 
+        /// Ends the session's work. A prebuffered player is not let go of here: whether it is the player now or is thrown away is the engine's to say.
         func end() {
             resolveTask?.cancel()
             startTask?.cancel()
             selectionTask?.cancel()
+            prebufferTask?.cancel()
             statusObservation = nil
             if let failureObserver { NotificationCenter.default.removeObserver(failureObserver) }
             failureObserver = nil
@@ -190,6 +240,8 @@ public final class AVPlayerEngine: PlaybackEngine {
     private var expectsPlaying = false
     private var stallWatch = StallWatch()
     private var timeObserver: Any?
+    /// The player the observers above are on.
+    private weak var observedPlayer: AVPlayer?
 
     /// - Parameter log: where a failed session is written in full (domain, code and
     ///   everything nested), under the tag `kensho`. The report to the reducer carries only a line.
@@ -213,7 +265,7 @@ public final class AVPlayerEngine: PlaybackEngine {
     }
 
     deinit {
-        if let timeObserver { player.removeTimeObserver(timeObserver) }
+        if let timeObserver { observedPlayer?.removeTimeObserver(timeObserver) }
         if let rateChangeObserver { NotificationCenter.default.removeObserver(rateChangeObserver) }
     }
 
@@ -251,6 +303,15 @@ public final class AVPlayerEngine: PlaybackEngine {
                 onEvent?(.engineFailed(epoch, reason: "no prepared session \(epoch.rawValue) to take over from \(replacing.rawValue)"))
                 return
             }
+            if let prebuffered = session.prebuffered, onPlayerChange != nil, !player.isExternalPlaybackActive {
+                // The replacement has its own player, loaded ahead of this one: it takes over as the player when this one gets to the place it waits at.
+                replacement = nil
+                endLive()
+                live = session
+                session.selection = selection
+                handOff(session, prebuffered: prebuffered)
+                return
+            }
             // Where the player is, not where the last tick said: the reducer's position is up to half a second old.
             let measured = player.currentTime().seconds
             replacement = nil
@@ -258,6 +319,9 @@ public final class AVPlayerEngine: PlaybackEngine {
             live = session
             session.startAt = measured.isFinite && abs(measured - at) < 5 ? measured : at
             session.selection = selection
+            // (A prebuffered replacement that cannot be handed over - nobody follows the change of player, or the picture is on a route that belongs to this
+            // one - is a prepared item like the others: its player gives the item up, and a copy goes on the running player.)
+            discardPrebuffer(of: session)
             // The prepared item has done its job - it proved on the staging player that the stream
             // loads - and cannot go any further: AVFoundation refuses an item that has been on one
             // player on another (NSInvalidArgumentException, even after it was taken off the first,
@@ -277,7 +341,9 @@ public final class AVPlayerEngine: PlaybackEngine {
             guard let session = live, session.epoch == epoch else { return }
             session.held = false
             expectsPlaying = true
-            player.play()
+            // (Not during a hand-off - it sets the new player going itself - and not for a player that goes: a start on the host clock is a rate of 1
+            // that has not begun, and `play()` would begin it early.)
+            if session.stage != .handingOff, player.rate == 0 { player.play() }
 
         case let .pause(epoch):
             guard let session = live, session.epoch == epoch else { return }
@@ -334,12 +400,14 @@ public final class AVPlayerEngine: PlaybackEngine {
             do {
                 let item = try await self.provider(ItemRequest(source: source, quality: quality, startAt: session.startAt, selection: session.selection))
                 guard !Task.isCancelled, self.isCurrent(session) else { return }
-                if item === self.player.currentItem || (self.isStagingCreated && item === self.staging.currentItem) {
+                if item === self.player.currentItem || (self.isStagingCreated && item === self.staging.currentItem) || item === self.replacement?.prebuffered?.item {
                     self.fail(session, reason: "the provider returned an item that is on a player already")
                     return
                 }
                 if session === self.live {
                     self.attachToPlayer(session, item: item)
+                } else if self.options.prebuffer != nil {
+                    self.attachToPrebuffer(session, item: item)
                 } else {
                     self.attachToStaging(session, item: item)
                 }
@@ -362,16 +430,7 @@ public final class AVPlayerEngine: PlaybackEngine {
     private func attachToPlayer(_ session: Session, item: AVPlayerItem) {
         session.stage = .starting
         session.item = item
-        observeStatus(of: session, item: item)
-        session.failureObserver = NotificationCenter.default.addObserver(
-            forName: AVPlayerItem.failedToPlayToEndTimeNotification, object: item, queue: .main
-        ) { [weak self, weak session] note in
-            let error = note.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error
-            Task { @MainActor in
-                guard let self, let session, session === self.live else { return }
-                self.fail(session, error: error)
-            }
-        }
+        watch(session, item: item)
         let setsGoing = session.startsAtOnce && !session.held
         expectsPlaying = setsGoing
         player.pause()
@@ -384,11 +443,151 @@ public final class AVPlayerEngine: PlaybackEngine {
         if setsGoing { player.play() }
     }
 
+    /// What the live session's item is watched for: its status (an item that is ready can still fail) and the end that is a failure.
+    private func watch(_ session: Session, item: AVPlayerItem) {
+        observeStatus(of: session, item: item)
+        session.failureObserver = NotificationCenter.default.addObserver(
+            forName: AVPlayerItem.failedToPlayToEndTimeNotification, object: item, queue: .main
+        ) { [weak self, weak session] note in
+            let error = note.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error
+            Task { @MainActor in
+                guard let self, let session, session === self.live else { return }
+                self.fail(session, error: error)
+            }
+        }
+    }
+
     private func attachToStaging(_ session: Session, item: AVPlayerItem) {
         session.stage = .loading
         session.item = item
         observeStatus(of: session, item: item)
         staging.replaceCurrentItem(with: item)
+    }
+
+    // MARK: - A replacement with a player of its own (`Options.prebuffer`)
+
+    /// Makes the replacement ready on a player of its own: loaded ahead of the running player, positioned, primed (`PrebufferedPlayer`). The reducer is told
+    /// `swapPrepared` when it can take over without a wait, not when the stream merely loads.
+    private func attachToPrebuffer(_ session: Session, item: AVPlayerItem) {
+        guard let settings = options.prebuffer else { return }
+        session.stage = .loading
+        session.item = item
+        let prebuffered = PrebufferedPlayer.beside(player, item: item, startAt: session.startAt, settings: settings)
+        session.prebuffered = prebuffered
+        if settings.waitsForFirstFrame { prebuffered.prime(on: stagingLayer) }
+        let began = ProcessInfo.processInfo.systemUptime
+        session.prebufferTask = Task { [weak self, weak session] in
+            guard let self, let session else { return }
+            do {
+                try await prebuffered.prepare()
+                guard !Task.isCancelled, session === self.replacement else { return }
+                // The viewer's tracks are carried out while the replacement waits, not after it has taken over: another audio rendition is a fetch of its own.
+                await self.applier(item, session.selection, session.applied)
+                session.applied = session.selection
+                guard !Task.isCancelled, session === self.replacement else { return }
+                session.stage = .prepared
+                self.log.log(String(format: "replacement %d ready after %.1f s, waiting at %.1f s with %.1f s loaded", session.epoch.rawValue,
+                                    ProcessInfo.processInfo.systemUptime - began, prebuffered.position, prebuffered.bufferedAhead(from: prebuffered.position)), tag: "kensho")
+                self.onEvent?(.swapPrepared(session.epoch))
+            } catch {
+                guard !Task.isCancelled, session === self.replacement else { return }
+                self.log.log("replacement \(session.epoch.rawValue) could not be made ready: \(error)", tag: "kensho")
+                self.fail(session, reason: (error as? PrebufferedPlayer.Failure).map { "the replacement could not be made ready: \($0)" } ?? Self.reason(for: error))
+            }
+        }
+    }
+
+    /// The end of the loaded part of `item` that contains `time`.
+    private func loadedEnd(of item: AVPlayerItem?, containing time: TimeInterval) -> TimeInterval? {
+        PrebufferedPlayer.loadedEnd(of: item, containing: time)
+    }
+
+    /// The prebuffered replacement takes over (`PrebufferedPlayer.handOver`): the running player plays on until the place it is handed over at, the
+    /// replacement - jumped there and primed - is set going on the host clock at the moment the running one gets there, and the running item ends there.
+    /// Then `player` is the replacement's, `onPlayerChange` says so, and the reducer is told `swapFinished`.
+    ///
+    /// (The running player is listened to no more from here on: its rate goes to 0 at the end of its part, and that is nobody's pause.) A hand-off that
+    /// cannot be made ends as a copy of the prepared item on the running player, the way a replacement is made without the option.
+    private func handOff(_ session: Session, prebuffered: PrebufferedPlayer) {
+        let old = player
+        let oldItem = old.currentItem
+        unobservePlayer()
+        session.stage = .handingOff
+        session.startTask = Task { [weak self, weak session] in
+            guard let self, let session else { return }
+            let outcome = await prebuffered.handOver(
+                from: old,
+                isHeld: { [weak session] in session?.held ?? true },
+                isCurrent: { [weak self, weak session] in
+                    guard let self, let session else { return false }
+                    return session === self.live && session.stage == .handingOff
+                },
+                log: { [weak self, weak session] line in self?.log.log("\(line) (replacement \(session?.epoch.rawValue ?? 0))", tag: "kensho") },
+                flip: { [weak self, weak session] playing in
+                    guard let self, let session else { return }
+                    self.completeFlip(session, prebuffered: prebuffered, old: old, playing: playing)
+                }
+            )
+            guard !Task.isCancelled, session === self.live, session.stage == .handingOff else { return }
+            if case .failed = outcome { self.fallBackToCopy(session, prebuffered: prebuffered, old: old, oldItem: oldItem) }
+        }
+    }
+
+    /// The replacement's player is `player` from here on.
+    private func completeFlip(_ session: Session, prebuffered: PrebufferedPlayer, old: AVPlayer, playing: Bool) {
+        let new = prebuffered.player
+        // What the owner had set on the player carries over (the replacement was silent while it waited).
+        new.isMuted = old.isMuted
+        new.volume = old.volume
+        new.allowsExternalPlayback = old.allowsExternalPlayback
+        new.actionAtItemEnd = old.actionAtItemEnd
+        new.defaultRate = old.defaultRate
+        let waitsToMinimizeStalls = old.automaticallyWaitsToMinimizeStalling
+        session.prebuffered = nil
+        session.item = prebuffered.item
+        player = new
+        expectsPlaying = playing
+        watch(session, item: prebuffered.item)
+        observePlayer()
+        // (The status of the new player is the one the stall watch goes on from: it was not listened to while it waited.)
+        _ = stallWatch.observe(new.timeControlStatus, seekInFlight: false, now: ProcessInfo.processInfo.systemUptime)
+        session.stage = .running
+        onPlayerChange?(new, old)
+        prebuffered.unprime()                                    // (after the owner has put the new player on its own layer)
+        onEvent?(session.atPosition(session.epoch))
+        // The hand-over has been made when the old player is let go of and the new one waits for the clock again - a moment later, so that neither the
+        // layer nor the start on the host clock is disturbed.
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 600_000_000)
+            old.pause()
+            old.currentItem?.forwardPlaybackEndTime = .invalid
+            old.replaceCurrentItem(with: nil)
+            guard let self, self.player === new else { return }
+            new.automaticallyWaitsToMinimizeStalling = waitsToMinimizeStalls
+        }
+        // The choice of tracks the viewer made after the replacement was asked for.
+        if session.applied != session.selection {
+            Task { @MainActor [weak self, weak session] in
+                guard let self, let session, session === self.live, let item = session.item else { return }
+                self.stallWatch.trackChanged(now: ProcessInfo.processInfo.systemUptime)
+                await self.applier(item, session.selection, session.applied)
+                session.applied = session.selection
+                self.stallWatch.trackChanged(now: ProcessInfo.processInfo.systemUptime)
+            }
+        }
+    }
+
+    /// A hand-off that could not be made: the replacement's player gives its item up, and a copy goes on the running player, which is listened to again.
+    private func fallBackToCopy(_ session: Session, prebuffered: PrebufferedPlayer, old: AVPlayer, oldItem: AVPlayerItem?) {
+        log.log("hand-off of \(session.epoch.rawValue) could not be made; the replacement goes on the running player as a copy", tag: "kensho")
+        let item = prebuffered.item
+        let measured = old.currentTime().seconds
+        oldItem?.forwardPlaybackEndTime = .invalid
+        discardPrebuffer(of: session)
+        session.startAt = measured.isFinite ? measured : session.startAt
+        observePlayer()
+        let copy = (item.copy() as? AVPlayerItem) ?? AVPlayerItem(asset: item.asset)
+        attachToPlayer(session, item: copy)
     }
 
     /// The status stays observed for as long as the session lives: an item that
@@ -498,20 +697,47 @@ public final class AVPlayerEngine: PlaybackEngine {
     }
 
     private func endLive() {
-        live?.end()
+        guard let session = live else { return }
+        session.end()
         live = nil
+        discardPrebuffer(of: session)
     }
 
     private func endReplacement() {
         guard let session = replacement else { return }
         replacement = nil
         session.end()
-        if session.item != nil { staging.replaceCurrentItem(with: nil) }
+        discardPrebuffer(of: session)
+        if session.item != nil, session.prebuffered == nil, isStagingCreated { staging.replaceCurrentItem(with: nil) }
+    }
+
+    /// Lets go of the replacement's own player, if it still has one (a replacement that took over has given it up: it is `player`).
+    private func discardPrebuffer(of session: Session) {
+        guard let prebuffered = session.prebuffered else { return }
+        session.prebuffered = nil
+        prebuffered.cancel()
+        if session.stage == .handingOff {
+            // The hand-off ended on the way: the player that plays is still this one, and it is listened to again.
+            player.currentItem?.forwardPlaybackEndTime = .invalid
+            observePlayer()
+        }
     }
 
     // MARK: - What the player says
 
+    /// Stops listening to the player (the one that is handed over: its rate goes to 0 at the end of its part, and that is not the viewer's pause).
+    private func unobservePlayer() {
+        rateObservation = nil
+        if let rateChangeObserver { NotificationCenter.default.removeObserver(rateChangeObserver) }
+        rateChangeObserver = nil
+        if let timeObserver { observedPlayer?.removeTimeObserver(timeObserver) }
+        timeObserver = nil
+        observedPlayer = nil
+    }
+
     private func observePlayer() {
+        guard observedPlayer !== player else { return }
+        observedPlayer = player
         rateObservation = player.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
             let status = player.timeControlStatus
             Task { @MainActor in

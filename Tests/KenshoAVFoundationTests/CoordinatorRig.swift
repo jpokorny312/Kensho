@@ -27,7 +27,7 @@ final class Rig {
     ///   - makesFiles: write the two files `film` and `film-lo` (40 s of silence each); a test that sets `files` itself, to streams, says no.
     ///   - recordsSelections: the applier only writes the choices down (`applied`); false leaves it to the engine's default applier, which chooses the
     ///     options of the item's real media selection groups.
-    init(options: AVPlayerEngine.Options = AVPlayerEngine.Options(), makesFiles: Bool = true, recordsSelections: Bool = true) throws {
+    init(options: AVPlayerEngine.Options = AVPlayerEngine.Options(), makesFiles: Bool = true, recordsSelections: Bool = true, log: KenshoLog = .silent) throws {
         directory = try TestMedia.makeDirectory()
         if makesFiles {
             files["film"] = try TestMedia.silentAudio(seconds: 40, in: directory, name: "film")
@@ -46,7 +46,8 @@ final class Rig {
                 return item
             },
             applier: recordsSelections ? { [weak self] _, selection in self?.applied.append(selection) } : nil,
-            options: options
+            options: options,
+            log: log
         )
         coordinator = PlaybackCoordinator(engine: engine, clock: { [weak self] in self?.now ?? 0 })
         // The phases the film went through: a state change that only moved the position is not one.

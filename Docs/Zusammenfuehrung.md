@@ -238,6 +238,50 @@ Die sechs Tests (`AVPlayerEngineForcedSubtitleTests`): am **alten** Code rot sin
 
 Für die übrigen Tests mit Bild (Tonspurwechsel, Start ohne Stau, fehlendes Bild, Sprung aus dem Stau, Engine des Autos) wurden keine Mutationen gemacht.
 
+## Der vorpuffernde Player (2026-10-21)
+
+**Auftrag:** „Baue den vorpuffernden Player in die Kensho Engine, damit Übergänge nahtlos sind.“
+
+**Der Befund.** Der Tausch der Engine (`prepareSwap` → `commitSwap`) brachte den Ersatz auf einem stillen Hilfs-Player nur bis `readyToPlay` und setzte dann eine **Kopie** des Items auf den laufenden Player. Das spart die Master-Playlist, aber nicht die Medien (die Kopie fragt Playlists und Segmente neu an), nicht das Dekodieren des ersten Bildes und nicht das Warten „to minimize stalls“ — auf einem echten iPhone stand das Bild bei jedem Wechsel fünf bis neun Sekunden. Gemessen mit einem echten `AVPlayer` und einem HLS-Strom, dessen Bilder ihre Nummer tragen (`ScreenLog`: die längste Zeit zwischen zwei Bildern, die den Film fortsetzen), der Ersatz `delay` Sekunden je Anfrage langsam:
+
+| Antwort des Ersatz-Servers | Kopie auf dem laufenden Player | Übergabe an einen vorgepufferten Player |
+|---|---|---|
+| sofort | 0,24 s | 0,06 s |
+| 0,3 s je Anfrage | 1,46 s | 0,05 s |
+| 0,6 s je Anfrage | 2,68 s | 0,05 s |
+
+(0,05 s sind ein Bild bei 24 Bildern pro Sekunde: das Bild steht nicht.)
+
+**Was AVFoundation dabei zeigte** (gemessen, nicht angenommen):
+
+- Ein `AVPlayerItem`, das auf einem Player war, lässt sich auf keinen anderen setzen (eine Ausnahme, die Swift nicht fängt). Übernommen wird deshalb der **Player**, nicht das Item.
+- `setRate(0, time:, atHostTime:)` hält den **laufenden** Player nicht zur Host-Zeit an, sondern sofort (das Bild stand 2,9 s). Das Ende des alten Items setzt man mit `forwardPlaybackEndTime`: es hört bildgenau an der Stelle auf. (`AVPlayerItemDidPlayToEndTime` wird für das alte Item gesendet: wer darauf hört, muss ansehen, welches Item es ist.)
+- Der Ersatz startet mit `setRate(1, time:, atHostTime:)` zur Host-Zeit, zu der der alte Player die Stelle erreicht. Das braucht `automaticallyWaitsToMinimizeStalling = false` — wie `preroll` —, also nur beim Ersatz-Player. `timeControlStatus` meldet dabei schon vor der Host-Zeit `.playing`, mit stehender Position.
+- Ein Player mit `automaticallyWaitsToMinimizeStalling = false`, dem man gleich `play()` sagt, kam im Test nicht in Gang (Rate 0 bei `.playing`): das gilt nur für den Ersatz, der laufende Player bleibt, wie er ist.
+- Sprünge innerhalb des Geladenen sind billig: 0,00 bis 0,04 s samt `preroll`, auch wenn der Server 0,6 s je Anfrage braucht.
+
+**Der Ablauf** (`PrebufferedPlayer`, `AVPlayerEngine.Options.prebuffer`, in den Apps `PlayerView.prepareSeamlessly` / `handOverSeamlessly`):
+
+1. *Beiseite laden.* Der Ersatz bekommt einen Player für sich (stumm, ohne externe Wiedergabe, ohne Warten), das Item wird **vorab** auf die Stelle gesetzt (ein wenig vor dem laufenden Player: die Stelle, an der dieser sein wird, wenn der Ersatz bereit ist; weniger, wenn dieser wenig gepuffert hat; gleich an seiner Stelle, wenn er steht) und lädt bis `bufferSeconds` ab dort, aber nicht weiter als `lead + 8 s`. Danach `preroll`. Erst dann meldet der Reducer `swapPrepared`.
+2. *Ausrichten.* Beim `commitSwap` springt der Ersatz auf die Stelle, die der laufende Player in 0,8 s erreicht (ein Sprung im Geladenen und das Vorbereiten: 0,0 bis 0,05 s Arbeit); ist der laufende schneller gewesen, eine zweite Runde weiter vorn, bis zu vier. Steht der laufende (wartet auf Daten), beginnt der Ersatz an dessen Stelle sofort; pausiert der Zuschauer, wird der Ersatz an dessen Stelle gelegt und startet nicht.
+3. *Übergeben.* Das Item des alten Players endet an der Stelle, der Ersatz startet dort zur Host-Zeit, und zwölf Millisekunden vorher meldet `onPlayerChange` den neuen Player (der Besitzer legt die Ebene um). Dann wird der alte nach 0,6 s freigegeben, und `automaticallyWaitsToMinimizeStalling` des neuen kommt zurück auf den Wert des alten.
+4. *Rückfall.* Gelingt die Übergabe nicht (die Stelle liegt nicht im Geladenen und wird nicht rechtzeitig geladen, der Ersatz fällt aus), setzt die Engine wie bisher eine Kopie auf den laufenden Player.
+
+**Wann die Engine es nicht tut** (dann gilt der Tausch wie ohne die Option): wenn der Besitzer `onPlayerChange` nicht gesetzt hat (er sähe einen Player an, der angehalten ist), wenn die Wiedergabe auf einer externen Route liegt (`isExternalPlaybackActive`: AirPlay, das Auto), und in den Apps, wenn Bild in Bild offen ist. Der Reducer gibt ein `pause` im Zustand `.switching` an die Engine weiter (der laufende Player läuft bis zur Übergabe, und der Zuschauer, der jetzt pausiert, soll nichts mehr von ihm hören): `testAPauseWhileTheReplacementTakesOverIsPassedOn…`.
+
+**Wenn die Übergabe abgebrochen wird oder spät kommt** (2026-10-21, nach den ersten Läufen in den Apps):
+
+- Der Besitzer ist beschäftigt, das Aufwachen kommt spät, das alte Item ist an seinem Ende schon angekommen: `AVPlayer.actionAtItemEnd` ist `.pause` (die Vorgabe eines `AVPlayer`), das Item bleibt also das des Players, `isCurrent()` bleibt wahr, und die Übergabe geschieht spät statt verloren zu sein. (Nicht `.advance`: das ist für einen `AVPlayer` ungültig und löst eine Objective-C-Ausnahme aus, die in asynchronem Code als Laufzeitfehler „freed pointer was not the last allocation" erscheint.)
+- Wird sie danach abgebrochen (`isCurrent()` falsch, der Zuschauer geht, die Verbindung wechselt), bekommt das alte Item sein Ende zurück (`forwardPlaybackEndTime = .invalid`), und hat es die Stelle inzwischen erreicht und hält der Zuschauer nicht an, spielt es nach 120 ms weiter (`giveTheEndBack`). Ein Besitzer, der den Ersatz selbst aufgegeben hat (`cancel()`), bekommt kein Weiterspielen mehr.
+- `AVPlayerItemDidPlayToEndTime` des alten Items ist kein Filmende, solange sein `forwardPlaybackEndTime` gesetzt ist: wer auf das Ende hört (die Apps tun es für die nächste Folge), prüft das.
+- Das Protokoll (`log:`) nennt in jedem Zweig, wo übergeben wurde: `hand-over at 23.07 s: the running player is at 22.30 s, in 0.76 s …`, `… waits for data (it is at …), this one begins at once`, `… the viewer has the playback paused, this one waits there`.
+
+Tests dazu: `testAWakeUpThatIsLateFindsTheOldItemAtItsEndAndTheHandOverIsMadeLate`, `testACalledOffHandOverGivesTheRunningItemItsEndBack` (`PrebufferedPlayerTests`).
+
+**Was nur auf einem Gerät zu sehen ist:** ob die Ebene das Bild des neuen Players im selben Bild zeigt (`stagingLayer` / `prime(on:)`: ein Player ohne Ebene dekodiert kein Bild, der Ersatz wartet deshalb auf einer Ebene von zwei Punkten unter dem Bild, in den Apps `PlayerLayerContainerView.primingLayer`), und Bild in Bild und AirPlay beim Wechsel. Die Apps schreiben dazu `seamless: the layer shows the picture of the player that took over (ready … ms after it was put on the layer)` ins Protokoll.
+
+**Tests** (`AVPlayerEnginePrebufferTests`, `PrebufferedPlayerTests`, auf macOS mit echtem `AVPlayer` und dem HLS-Strom mit Bild; der Server antwortet 0,5 bis 1,0 s zu spät): der Wechsel ohne stehendes Bild (< 0,25 s, ohne Sprung der Bildnummern, der alte Player stoppt dort, wo der neue beginnt, und wird freigegeben), die Gegenprobe ohne Option (> 0,9 s), ein Ersatz, der nicht fertig ist, solange ein Segment fehlt (der laufende spielt weiter), die Frist, ein Ersatz, der nicht geladen werden kann, Pause / Sprung / Stopp / neues Laden mitten in der Übergabe, ein pausierter und ein trockengelaufener laufender Player, zwei Wechsel hintereinander, der Rückfall ohne `onPlayerChange`, und der Baustein allein (bereit mit geladenem Puffer, Sprung im Geladenen unter 0,5 s, Sprung außerhalb, Frist, Fehler, Abbruch).
+
 ## Der Schatten in Ensō (Schritt 1 der offenen Arbeit)
 
 **Gebaut** auf dem Ensō-Zweig `claude/kensho-shadow` (seit dem 2026-10-19 auf `main`, lokal, nicht gepusht; `Scripts/kensho-sync.sh` hält `Kensho/` in Ensō und dieses Repository gleich). Beide `PlayerView`s wurden vollständig gelesen, bevor ein Haken gesetzt wurde. Neben dem alten Code läuft ein `PlaybackShadow`; die Haken stehen neben der Zeile, die der alte Code ohnehin ausführt, und ändern nichts am Ablauf:

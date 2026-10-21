@@ -83,6 +83,11 @@ public enum PlaybackReducer {
                 // Under the contract nothing plays yet (a session starts paused), so to such an engine this is a pause of a paused player. An
                 // engine that plays at once (`AVPlayerEngine.Options.startsPlayingAtOnce`: the car's) has to be told to hold - nothing else would.
                 fx.append(.pause(s.epoch))
+            case .switching:
+                // The same for a replacement that takes over (`commitSwap`): the engine starts it paused, and the pause is no news to it - but an engine
+                // that hands the playback over from a player that plays on to one that was made ready beside it (`AVPlayerEngine.Options.prebuffer`) has
+                // a running player to stop, and the viewer who pauses now must not hear a second more of the old one.
+                fx.append(.pause(s.epoch))
             default:
                 break
             }

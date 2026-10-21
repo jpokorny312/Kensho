@@ -170,6 +170,16 @@ final class PlaybackReducerTests: XCTestCase {
         XCTAssertFalse(fx.contains(.play(Epoch(2))))
     }
 
+    func testAPauseWhileTheReplacementTakesOverIsPassedOnToTheEngineAndHoldsThePlaybackPausedAfterwards() {
+        var (s, fx) = run([.requestQuality(lo, now: 100), .swapPrepared(Epoch(2)), .pause], from: playing())
+        XCTAssertEqual(s.phase, .switching, "the take-over goes on")
+        XCTAssertFalse(s.wantsPlay)
+        XCTAssertEqual(fx.last, .pause(Epoch(2)), "an engine that hands over from a player that plays on has to stop it")
+        (s, fx) = run([.swapFinished(Epoch(2))], from: s)
+        XCTAssertEqual(s.phase, .paused)
+        XCTAssertFalse(fx.contains(.play(Epoch(2))), "and nothing plays when the replacement is at its position")
+    }
+
     func testOldSessionEventsAfterTheTakeOverAreDropped() {
         let (s, _) = run([
             .requestQuality(lo, now: 100),
