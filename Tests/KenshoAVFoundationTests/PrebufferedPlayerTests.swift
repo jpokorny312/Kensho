@@ -180,6 +180,46 @@ final class PrebufferedPlayerTests: XCTestCase {
         old.pause()
     }
 
+    /// The next episode: another stream on a timeline of its own. The running player plays on while the other is made ready (the viewer sees the credits,
+    /// not a black picture); at the cut it stops and the other begins where it waits, at once.
+    func testACutOverBeginsTheOtherStreamWhereItWaitsAndStopsTheRunningOne() async throws {
+        let oldStream = try await fixture(seconds: 60)
+        let nextEpisode = try await fixture(seconds: 60)
+        let (old, _) = try await runningPlayer(on: oldStream)
+        let before = old.currentTime().seconds
+        let staged = PrebufferedPlayer(item: AVPlayerItem(url: nextEpisode.masterURL("hi")), position: 0, plan: plan)
+        try await staged.prepare()
+        XCTAssertGreaterThan(old.currentTime().seconds, before, "the running player went on while the other was made ready")
+        XCTAssertEqual(staged.player.rate, 0, "and the other waits")
+        var flipped = false
+        let outcome = await staged.cutOver(from: old, isCurrent: { true }, flip: { flipped = true })
+        XCTAssertEqual(outcome, .handedOver)
+        XCTAssertTrue(flipped)
+        XCTAssertEqual(old.rate, 0, "the running player stopped")
+        let deadline = Date().addingTimeInterval(5)
+        while Date() < deadline, staged.player.currentTime().seconds < 0.8 { try await Task.sleep(nanoseconds: 50_000_000) }
+        XCTAssertGreaterThan(staged.player.currentTime().seconds, 0.8, "the other plays from where it waited")
+        XCTAssertLessThan(staged.player.currentTime().seconds, 3.0, "and it began at the cut, not before")
+        XCTAssertGreaterThan(staged.player.rate, 0)
+        staged.cancel()
+    }
+
+    /// A cut that is called off at the last moment (another episode was chosen meanwhile) leaves the running player as it is.
+    func testACutOverThatIsCalledOffLeavesTheRunningPlayerAlone() async throws {
+        let oldStream = try await fixture(seconds: 60)
+        let nextEpisode = try await fixture(seconds: 60)
+        let (old, oldItem) = try await runningPlayer(on: oldStream)
+        let staged = PrebufferedPlayer(item: AVPlayerItem(url: nextEpisode.masterURL("hi")), position: 0, plan: plan)
+        try await staged.prepare()
+        let outcome = await staged.cutOver(from: old, isCurrent: { false }, flip: { XCTFail("nothing is handed over") })
+        XCTAssertEqual(outcome, .cancelled)
+        XCTAssertTrue(old.currentItem === oldItem)
+        XCTAssertGreaterThan(old.rate, 0, "the running player plays on")
+        XCTAssertEqual(staged.player.rate, 0, "and the other still waits")
+        staged.cancel()
+        old.pause()
+    }
+
     func testCancellingWhileItIsBeingMadeReadyEndsThePreparation() async throws {
         let hls = try await fixture()
         hls.holdVideoSegment(6)

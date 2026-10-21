@@ -317,6 +317,23 @@ public final class PrebufferedPlayer {
         if !isCancelled, !isHeld(), old.currentItem === item, old.rate == 0 { old.play() }
     }
 
+    /// Hands the playback over to this player **as it waits**: the running player stops and this one begins at the place it waits at. For a stream on a
+    /// timeline of its own - the next episode, the one the viewer chose - where no place is shared with the running player and nothing is aligned: what
+    /// `handOver(from:...)` does for the same stream in another quality. The running player plays on until the call is made (the viewer sees the credits,
+    /// not a black picture, while the next episode is got ready), and the cut is the one frame it takes this player to start.
+    ///
+    /// - Parameters:
+    ///   - isCurrent: false when a newer instruction has ended this hand-over (checked once, at the moment of the cut).
+    ///   - flip: called at the moment the picture must change: the owner shows this player now. It plays from here on.
+    public func cutOver(from old: AVPlayer, isCurrent: @MainActor () -> Bool, flip: @MainActor () -> Void) async -> HandOverOutcome {
+        guard !isCancelled, isCurrent() else { return .cancelled }
+        guard item.status == .readyToPlay else { return .failed("the item is not ready") }
+        // (The preparation put it where it waits and primed it; nothing has moved it since.)
+        startAtOnce(at: position, replacing: old, rate: old.defaultRate > 0 ? old.defaultRate : 1)
+        flip()
+        return .handedOver
+    }
+
     /// Starts here at `time` in a moment (the running player is stopped): a hand-over to a player that waits for data, or one that starts at once.
     private func startAtOnce(at time: TimeInterval, replacing old: AVPlayer, rate: Float) {
         let hostAt = CMTimeAdd(CMClockGetTime(CMClockGetHostTimeClock()), CMTime(seconds: 0.03, preferredTimescale: 1_000_000_000))
