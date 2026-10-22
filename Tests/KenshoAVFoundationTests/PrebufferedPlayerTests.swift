@@ -220,6 +220,119 @@ final class PrebufferedPlayerTests: XCTestCase {
         old.pause()
     }
 
+    // MARK: - A place far ahead, a place that is not loaded, a jump that does not come back
+
+    /// A hand-over aimed far ahead (the replacement is prepared at the place the running player will get to when the server's encoder has started - a few
+    /// seconds from now, a few tens on a real server): the running player plays on, and the hand-over is made when it gets there - not before, not behind.
+    func testAHandOverAimedFarAheadWaitsForTheRunningPlayerAndIsMadeWhenItGetsThere() async throws {
+        let hls = try await fixture(seconds: 60)
+        let (old, oldItem) = try await runningPlayer(on: hls)
+        let target = old.currentTime().seconds + 7
+        let staged = PrebufferedPlayer(item: AVPlayerItem(url: hls.masterURL("hi")), position: target, plan: plan)
+        try await staged.prepare()
+        let began = Date()
+        var flippedAt: TimeInterval?
+        var flippedAfter: TimeInterval?
+        let outcome = await staged.handOver(
+            from: old,
+            aimedAt: target,
+            isHeld: { false },
+            isCurrent: { old.currentItem === oldItem },
+            flip: { _ in
+                flippedAt = old.currentTime().seconds
+                flippedAfter = Date().timeIntervalSince(began)
+            }
+        )
+        XCTAssertEqual(outcome, .handedOver)
+        let at = try XCTUnwrap(flippedAt)
+        XCTAssertEqual(at, target, accuracy: 0.5, "the running player had got to the place when the picture changed")
+        XCTAssertGreaterThan(try XCTUnwrap(flippedAfter), 4, "it was waited for (the place was seven seconds ahead)")
+        XCTAssertGreaterThan(staged.player.rate, 0)
+        staged.cancel()
+        old.pause()
+    }
+
+    /// The replacement was ready late: the running player is far past what it has loaded. That is not chased (a jump out of what is loaded is a fetch, and
+    /// a running player outruns it: four rounds in 24 s on a real iPhone) - the owner is told at once, and the running player is left as it is.
+    func testAPlaceThatIsNotLoadedIsNotChasedAndTheRunningPlayerIsLeftAlone() async throws {
+        let hls = try await fixture(seconds: 60)
+        let (old, oldItem) = try await runningPlayer(on: hls)
+        // waits where the running player was five seconds ago: it has 6 s loaded from there, the running player is past that
+        let staged = PrebufferedPlayer(item: AVPlayerItem(url: hls.masterURL("hi")), position: 0.5, plan: .init(bufferSeconds: 3, forwardBufferSeconds: 3, timeout: 20, waitsForFirstFrame: false))
+        try await staged.prepare()
+        try await Task.sleep(nanoseconds: 1_200_000_000)
+        _ = await old.seek(to: CMTime(seconds: 30, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
+        try await Task.sleep(nanoseconds: 800_000_000)
+        let began = Date()
+        let outcome = await staged.handOver(from: old, isHeld: { false }, isCurrent: { old.currentItem === oldItem }, flip: { _ in XCTFail("nothing is handed over") })
+        let took = Date().timeIntervalSince(began)
+        guard case .failed = outcome else { return XCTFail("a place that is not loaded cannot be handed over to: \(outcome)") }
+        XCTAssertLessThan(took, 6, "said at once, not after rounds of fetching")
+        XCTAssertFalse(oldItem.forwardPlaybackEndTime.isValid, "the running item does not end anywhere")
+        XCTAssertGreaterThan(old.rate, 0, "and the running player plays on")
+        staged.cancel()
+        old.pause()
+    }
+
+    /// A running player that is not going (paused, or waiting for data) a little before the place this player waits at: this player begins where it waits -
+    /// it does not jump back out of what is loaded (the jump into a part that the server had not produced was the one that never came back).
+    func testARunningPlayerThatStandsJustBeforeTheWaitingPlaceIsNotChasedBackwards() async throws {
+        let hls = try await fixture(seconds: 60)
+        let (old, oldItem) = try await runningPlayer(on: hls)
+        old.pause()
+        let stands = old.currentTime().seconds
+        let staged = PrebufferedPlayer(item: AVPlayerItem(url: hls.masterURL("hi")), position: stands + 0.25, plan: plan)
+        try await staged.prepare()
+        var flipped = false
+        let began = Date()
+        let outcome = await staged.handOver(from: old, isHeld: { true }, isCurrent: { old.currentItem === oldItem }, flip: { playing in
+            flipped = true
+            XCTAssertFalse(playing, "the viewer holds it: it waits there")
+        })
+        XCTAssertEqual(outcome, .handedOver)
+        XCTAssertTrue(flipped)
+        XCTAssertLessThan(Date().timeIntervalSince(began), 3, "quick: nothing was fetched")
+        XCTAssertEqual(staged.player.currentTime().seconds, stands + 0.25, accuracy: 0.1, "where it waited, not before it")
+        staged.cancel()
+    }
+
+    /// The viewer pauses while the hand-over waits for a place some seconds ahead: the picture must not jump to the place (it would skip what the viewer has
+    /// not seen) - the hand-over is not made, and the running player stays where the viewer paused it.
+    func testAViewerWhoPausesWhileTheHandOverWaitsForAPlaceFarAheadIsNotSkippedAhead() async throws {
+        let hls = try await fixture(seconds: 60)
+        let (old, oldItem) = try await runningPlayer(on: hls)
+        let target = old.currentTime().seconds + 14
+        let staged = PrebufferedPlayer(item: AVPlayerItem(url: hls.masterURL("hi")), position: target, plan: plan)
+        try await staged.prepare()
+        var held = false
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            old.pause()
+            held = true
+        }
+        let outcome = await staged.handOver(from: old, aimedAt: target, isHeld: { held }, isCurrent: { old.currentItem === oldItem }, flip: { _ in XCTFail("nothing is handed over") })
+        guard case .failed = outcome else { return XCTFail("a pause before the place is no hand-over to the place: \(outcome)") }
+        XCTAssertLessThan(old.currentTime().seconds, target - 5, "the running player stands where the viewer paused it")
+        XCTAssertEqual(old.rate, 0)
+        XCTAssertFalse(oldItem.forwardPlaybackEndTime.isValid)
+        staged.cancel()
+    }
+
+    /// A jump that has to fetch from a server that does not answer never completes by itself (an HLS seek waits for its segment): it is cancelled after a
+    /// few seconds and counts as no jump.
+    func testAJumpOutOfWhatIsLoadedThatTheServerDoesNotAnswerIsGivenUp() async throws {
+        let hls = try await fixture(seconds: 60)
+        let staged = PrebufferedPlayer(item: AVPlayerItem(url: hls.masterURL("hi")), position: 5, plan: plan)
+        try await staged.prepare()
+        let farAway = hls.videoSegmentIndex(at: 40)
+        for index in max(0, farAway - 2)...(farAway + 2) { hls.holdVideoSegment(index) }
+        let began = Date()
+        let aligned = await staged.align(to: 40, tail: 2, waits: 1)
+        XCTAssertFalse(aligned, "nothing was there to jump to")
+        XCTAssertLessThan(Date().timeIntervalSince(began), 12, "and the call came back")
+        staged.cancel()
+    }
+
     func testCancellingWhileItIsBeingMadeReadyEndsThePreparation() async throws {
         let hls = try await fixture()
         hls.holdVideoSegment(6)

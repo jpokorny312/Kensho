@@ -187,6 +187,9 @@ public final class PrebufferedPlayer {
     static let alignSeconds = 0.8
     /// What must be loaded after the place of the hand-over.
     static let handOverTail = 2.0
+    /// How far before the place this player waits at a running player that waits for data may stand for this one to take over from where it waits (the
+    /// seconds between are not shown; a player that stands there shows nothing anyway).
+    static let waitingReach = 4.0
 
     public enum HandOverOutcome: Equatable, Sendable {
         /// `flip` was called: this player is the one that plays now.
@@ -203,17 +206,26 @@ public final class PrebufferedPlayer {
     /// not stand. `old` itself is not touched otherwise - when to let go of it is the owner's.
     ///
     /// The place is a little ahead of `old` (the time a jump inside what is loaded and a priming take: `alignSeconds`), at least where this player waits, and
-    /// not past what `old` has loaded. A running player that waits for data (it ran dry) is not waited for: this player begins where it stands. A viewer who
-    /// pauses (`isHeld`) gets this player put where `old` stopped, paused. A round that was late - `old` passed the place while the jump was made - is made
-    /// again further ahead, up to four.
+    /// not past what `old` has loaded. A running player that waits for data (it ran dry) is not waited for: this player begins where it stands - or, when it
+    /// stands a little before the place this player waits at, where this one waits (nothing earlier is loaded, and a jump back into what is not loaded is a
+    /// fetch). A viewer who pauses (`isHeld`) gets this player put where `old` stopped, paused. A round that was late - `old` passed the place while the
+    /// player was primed - is made again further ahead, up to four.
+    ///
+    /// **A place that is not loaded is not chased.** A jump out of what is loaded is a fetch - and for a transcode a new start of the server's encoder, which
+    /// the running player outruns (a real iPhone, 2026-10-21: the replacement was ready after 19 s, the running player was 17 s ahead of what it had loaded,
+    /// and four rounds of fetching in 24 s never got there; a jump 0.2 s back into what was not loaded hung for a minute). The hand-over then says so at
+    /// once (`.failed`) and the owner goes the old way while whatever it prepared is still warm.
     ///
     /// - Parameters:
+    ///   - aimedAt: the place this player was prepared for (it waits there, `position`), further ahead than a few seconds: the hand-over waits for `old` to
+    ///     get there - as long as it plays, and not longer than it needs plus ten seconds - and is made at that place. nil: the place is `old`'s.
     ///   - isHeld: the viewer wants the playback paused; asked at every decision.
     ///   - isCurrent: false when a newer instruction has ended this hand-over.
     ///   - flip: called at the moment the picture must change (a few milliseconds before the start): the owner shows this player now. `playing` says whether
     ///     it is going or paused.
     public func handOver(
         from old: AVPlayer,
+        aimedAt target: TimeInterval? = nil,
         isHeld: @MainActor () -> Bool,
         isCurrent: @MainActor () -> Bool,
         log: @MainActor (String) -> Void = { _ in },
@@ -221,9 +233,41 @@ public final class PrebufferedPlayer {
     ) async -> HandOverOutcome {
         let oldItem = old.currentItem
         let began = ProcessInfo.processInfo.systemUptime
+        var workBegan = began
+
+        // A place far ahead: the running player plays on until it is about to get there.
+        if let target {
+            let now0 = old.currentTime().seconds
+            guard now0.isFinite else { return .failed("the running player has no time") }
+            let speed0 = old.rate > 0 ? Double(old.rate) : 1
+            let arrivalLimit = began + max(0, target - now0) / speed0 * 1.5 + 10
+            var ranDryAt: TimeInterval?
+            while true {
+                guard !isCancelled, isCurrent() else { return .cancelled }
+                let now = old.currentTime().seconds
+                guard now.isFinite else { return .failed("the running player has no time") }
+                let wantsToPlay = !isHeld() && old.rate > 0
+                let speed = old.rate > 0 ? Double(old.rate) : 1
+                if !wantsToPlay || now >= target - Self.alignSeconds * 1.5 * speed { break }
+                let uptime = ProcessInfo.processInfo.systemUptime
+                if old.timeControlStatus == .playing {
+                    ranDryAt = nil
+                } else {
+                    // It waits for data. Close to the place this player waits at it is the way on (below); far before it, it is a wait that may be over in a
+                    // moment - and not for long: a player that stood for six seconds a good way before the place will not get there.
+                    if target - now <= 4 { break }
+                    ranDryAt = ranDryAt ?? uptime
+                    if uptime - (ranDryAt ?? uptime) > 6 { return .failed(String(format: "the running player ran dry at %.1f s, far before the place %.1f s", now, target)) }
+                }
+                if uptime > arrivalLimit { return .failed(String(format: "the running player did not get to the place %.1f s in time (at %.1f s)", target, now)) }
+                try? await Task.sleep(nanoseconds: 80_000_000)
+            }
+            workBegan = ProcessInfo.processInfo.systemUptime
+        }
+
         for round in 0..<4 {
             guard !isCancelled, isCurrent() else { return .cancelled }
-            guard ProcessInfo.processInfo.systemUptime - began < 25 else { return .failed("the hand-over took too long") }
+            guard ProcessInfo.processInfo.systemUptime - workBegan < 12 else { return .failed("the hand-over took too long") }
             let now = old.currentTime().seconds
             guard now.isFinite else { return .failed("the running player has no time") }
             let wantsToPlay = !isHeld() && old.rate > 0
@@ -239,26 +283,39 @@ public final class PrebufferedPlayer {
                 if let reach = Self.loadedEnd(of: oldItem, containing: now), place > reach - 0.1 { place = max(now + 0.15, reach - 0.1) }
                 // ... and not before the place this player waits at: it has nothing earlier loaded.
                 place = max(place, position)
-            }
-            // (A running player that waits for data, or is paused: this player begins where it stands. Jumping ahead to what is loaded would skip what it
-            // never showed.)
-            guard await align(to: place, tail: Self.handOverTail) else {
-                // A stalled player and nothing loaded where it stands: the place this player waits at is the way on.
-                if !playing, wantsToPlay, place < position, await align(to: position, tail: Self.handOverTail) {
-                    guard !isCancelled, isCurrent() else { return .cancelled }
-                    log(String(format: "hand-over at %.2f s: the running player waits for data at %.2f s and has nothing loaded there, this one begins where it waits", position, now))
-                    startAtOnce(at: position, replacing: old, rate: Float(speed))
-                    flip(true)
-                    return .handedOver
+            } else {
+                // (A running player that waits for data, or is paused: this player begins where it stands - jumping ahead to what is loaded would skip what it
+                // never showed - but not before the place it waits at: a jump back out of what is loaded is a fetch, and a standing player is not outrun
+                // by anything but that fetch.)
+                // And not when this player waits far ahead of where the running one stands (a viewer who paused while the hand-over waited for a place some
+                // seconds on): the picture would jump over what the viewer has not seen.
+                if position - now > Self.waitingReach {
+                    return .failed(String(format: "this player waits at %.1f s, %.1f s ahead of the running player that does not play (it is at %.1f s)", position, position - now, now))
                 }
+                if position > now { place = position } else { place = max(now, position) }
+            }
+            // A place that is not loaded is not chased (a jump out of what is loaded is a fetch, which a running player outruns): a short wait for the loader,
+            // which goes on forward by itself, and then the owner is told.
+            if !covers(place) {
+                _ = try? await wait(until: Date().addingTimeInterval(2.5), "the part around the place to be loaded") { self.covers(place) || self.item.status == .failed }
+                guard !isCancelled, isCurrent() else { return .cancelled }
+                if !covers(place) {
+                    let bounds = loaded
+                    return .failed(String(format: "the place %.1f s is not loaded (this player has %.1f to %.1f s)", place, bounds?.lowerBound ?? position, bounds?.upperBound ?? position))
+                }
+            }
+            guard await align(to: place, tail: Self.handOverTail, waits: 0) else {
                 return isCancelled || !isCurrent() ? .cancelled : .failed("could not jump to \(place) s")
             }
             guard !isCancelled, isCurrent() else { return .cancelled }
 
             if isHeld() || !wantsToPlay {
                 // Paused (by the viewer, now or while this player was made ready): it is put where the running player stands, and nothing starts.
-                let stands = old.currentTime().seconds
-                if abs(stands - place) > 0.02, !(await align(to: stands, tail: Self.handOverTail)) { return .failed("could not jump to \(stands) s") }
+                let stands = max(old.currentTime().seconds, position)
+                if abs(stands - place) > 0.02 {
+                    guard covers(stands) else { return .failed("could not jump to \(stands) s") }
+                    guard await align(to: stands, tail: Self.handOverTail, waits: 0) else { return .failed("could not jump to \(stands) s") }
+                }
                 guard !isCancelled, isCurrent() else { return .cancelled }
                 log(String(format: "hand-over at %.2f s: the viewer has the playback paused, this one waits there", stands))
                 flip(false)
@@ -274,7 +331,7 @@ public final class PrebufferedPlayer {
             if after > place - 0.06 * speed { continue }                  // the running player has passed the place meanwhile: another round, further ahead
             let wait = (place - after) / speed
             log(String(format: "hand-over at %.2f s: the running player is at %.2f s, in %.2f s (round %d, %.2f s of work)", place, after, wait, round + 1,
-                       ProcessInfo.processInfo.systemUptime - began))
+                       ProcessInfo.processInfo.systemUptime - workBegan))
             // The one stops where the other begins: the item ends at `place`, this player starts there on the host clock. (A player pauses at the end of
             // its item - `actionAtItemEnd` is `.pause` unless the owner chose otherwise - and keeps it: a wake-up that is late, the main actor being busy,
             // finds the item still there, and the hand-over is late, not lost.)
@@ -293,7 +350,7 @@ public final class PrebufferedPlayer {
                 // player stopped (the picture it shows paused is the one the viewer paused on).
                 player.pause()
                 let stands = old.currentTime().seconds
-                if stands.isFinite, abs(stands - place) > 0.05 { _ = await align(to: stands, tail: Self.handOverTail) }
+                if stands.isFinite, abs(stands - place) > 0.05, covers(stands) { _ = await align(to: stands, tail: Self.handOverTail, waits: 0) }
                 guard !isCancelled, isCurrent() else {
                     await giveTheEndBack(of: oldItem, on: old, isHeld: isHeld)
                     return .cancelled
@@ -362,6 +419,11 @@ public final class PrebufferedPlayer {
         return 0
     }
 
+    /// Whether `time` is inside what is loaded, with the tail a hand-over needs after it (or the end of the stream).
+    func covers(_ time: TimeInterval) -> Bool {
+        bufferedAhead(from: time) >= min(Self.handOverTail, remaining(from: time))
+    }
+
     /// How much of the stream is left from `time` on (a stream whose length is not known yet: a lot).
     public func remaining(from time: TimeInterval) -> TimeInterval {
         item.duration.isNumeric ? max(0, item.duration.seconds - time) : .greatestFiniteMagnitude
@@ -378,10 +440,25 @@ public final class PrebufferedPlayer {
 
     // MARK: - Pieces
 
-    private func jump(to time: TimeInterval) async -> Bool {
+    /// Jumps the item to `time`, exact. A jump that does not come back in `timeout` seconds is cancelled (a seek of an HLS item that has to fetch from a
+    /// server that does not answer never completes by itself) and counts as no jump.
+    private func jump(to time: TimeInterval, timeout: TimeInterval = 4) async -> Bool {
         let target = CMTime(seconds: time, preferredTimescale: 600)
+        let began = ProcessInfo.processInfo.systemUptime
         for _ in 0..<3 where !isCancelled {
-            if await item.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { return true }
+            let item = self.item
+            let done = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+                let once = ResumeOnce(continuation)
+                item.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { finished in once.resume(finished) }
+                DispatchQueue.main.asyncAfter(deadline: .now() + timeout) {
+                    if !once.isResumed {
+                        item.cancelPendingSeeks()
+                        once.resume(false)
+                    }
+                }
+            }
+            if done { return true }
+            if ProcessInfo.processInfo.systemUptime - began > timeout * 1.5 { break }
         }
         return false
     }
@@ -407,5 +484,23 @@ public final class PrebufferedPlayer {
     static func describe(_ error: Error?) -> String {
         guard let error = error as NSError? else { return "unknown failure" }
         return "\(error.domain) \(error.code): \(error.localizedDescription)"
+    }
+}
+
+/// Resumes a continuation once, from whichever thread gets there first (the completion of a seek and the timer that gives it up).
+private final class ResumeOnce: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Bool, Never>?
+
+    init(_ continuation: CheckedContinuation<Bool, Never>) { self.continuation = continuation }
+
+    var isResumed: Bool { lock.withLock { continuation == nil } }
+
+    func resume(_ value: Bool) {
+        let taken = lock.withLock { () -> CheckedContinuation<Bool, Never>? in
+            defer { continuation = nil }
+            return continuation
+        }
+        taken?.resume(returning: value)
     }
 }
